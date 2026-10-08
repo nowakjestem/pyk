@@ -9,7 +9,7 @@ from pathlib import Path
 
 from .config import Config, Video
 from .errors import PermanentError
-from .openai_asr import parse_openai, transcribe_audio
+from .openai_asr import parse_openai, parse_text, transcribe_audio
 from .process import run_process
 from .resources import check_resources
 from .subtitles import Cue, parse_whisper
@@ -126,6 +126,78 @@ def silent_audio(path: Path) -> bool:
     return count == 0 or math.sqrt(total / count) / 32768 < 0.0005
 
 
+def text_audio_windows(path: Path, target_seconds: int) -> list[tuple[int, int]]:
+    """Split PCM at nearby pauses; avoid cutting a word at every fixed boundary."""
+    with wave.open(str(path), "rb") as audio:
+        rate, frames = audio.getframerate(), audio.getnframes()
+        if audio.getnchannels() != 1 or audio.getsampwidth() != 2 or rate != 16000:
+            raise PermanentError("Niepoprawny format audio do transkrypcji.")
+        step = rate // 50
+        pauses = []
+        quiet_start = None
+        position = 0
+        while data := audio.readframes(step):
+            samples = struct.unpack(f"<{len(data) // 2}h", data)
+            quiet = sum(value * value for value in samples) / len(samples) < (32768 * 0.01) ** 2
+            if quiet and quiet_start is None:
+                quiet_start = position
+            if not quiet and quiet_start is not None:
+                if position - quiet_start >= rate * 0.12:
+                    pauses.append((quiet_start + position) // 2)
+                quiet_start = None
+            position += len(samples)
+        windows = []
+        first = 0
+        while first < frames:
+            target = min(frames, first + target_seconds * rate)
+            if frames - target <= rate * 1.5:
+                last = frames
+            else:
+                nearby = [p for p in pauses if target - rate * 1.5 <= p <= target]
+                last = nearby[-1] if nearby else target
+            windows.append((first, last))
+            first = last
+        return windows
+
+
+async def transcribe_text_windows(
+    audio: Path, root: Path, config: Config, offset: float, duration: float
+) -> list[Cue]:
+    cues = []
+    window_audio = root / "text-window.wav"
+    with wave.open(str(audio), "rb") as source:
+        rate = source.getframerate()
+        for first, last in text_audio_windows(audio, config.asr.text_chunk_seconds):
+            start, end = offset + first / rate, offset + min(duration, last / rate)
+            cache = root / f"gpt-transcribe-{round(start * rate):010}.json"
+            try:
+                if cache.is_file():
+                    try:
+                        document = json.loads(cache.read_text(encoding="utf-8"))
+                    except ValueError as exc:
+                        raise PermanentError(
+                            "Niepoprawny zapis transkrypcji GPT na dysku."
+                        ) from exc
+                else:
+                    source.setpos(first)
+                    with wave.open(str(window_audio), "wb") as output:
+                        output.setparams(source.getparams())
+                        output.writeframes(source.readframes(last - first))
+                    if silent_audio(window_audio):
+                        document = {"text": ""}
+                    else:
+                        document = await transcribe_audio(window_audio, config.asr)
+                chunk_cues = parse_text(document, start=start, end=end)
+                if not cache.is_file():
+                    temporary = cache.with_suffix(".part.json")
+                    temporary.write_text(json.dumps(document, ensure_ascii=False), encoding="utf-8")
+                    temporary.replace(cache)
+                cues.extend(chunk_cues)
+            finally:
+                window_audio.unlink(missing_ok=True)
+    return cues
+
+
 async def transcribe(source: Path, chapter: dict, root: Path, config: Config) -> list[Cue]:
     if config.asr.provider == "local" and not config.asr.model_path.is_file():
         raise PermanentError("Brak modelu ASR. Uruchom komendę rolki model-download.")
@@ -145,12 +217,19 @@ async def transcribe(source: Path, chapter: dict, root: Path, config: Config) ->
             if silent_audio(audio):
                 continue
             if config.asr.provider == "openai":
+                if config.asr.model == "gpt-transcribe":
+                    cues.extend(
+                        await transcribe_text_windows(audio, root, config, offset, chunk_duration)
+                    )
+                    continue
                 cached = root / f"openai-{offset:05}.json"
                 if cached.is_file():
                     try:
                         document = json.loads(cached.read_text(encoding="utf-8"))
                     except ValueError as exc:
-                        raise PermanentError("Niepoprawny zapis transkrypcji OpenAI na dysku.") from exc
+                        raise PermanentError(
+                            "Niepoprawny zapis transkrypcji OpenAI na dysku."
+                        ) from exc
                 else:
                     document = await transcribe_audio(audio, config.asr)
                 chunk_cues = parse_openai(document, offset=offset, duration=chunk_duration)

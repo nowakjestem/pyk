@@ -131,11 +131,15 @@ async def transcribe_audio(audio: Path, config: ASR) -> dict:
             form = aiohttp.FormData()
             form.add_field("file", source, filename="audio.wav", content_type="audio/wav")
             form.add_field("model", config.model)
-            form.add_field("response_format", "verbose_json")
-            form.add_field("timestamp_granularities[]", "word")
-            form.add_field("timestamp_granularities[]", "segment")
+            if config.model == "gpt-transcribe":
+                form.add_field("response_format", "json")
+            else:
+                form.add_field("response_format", "verbose_json")
+                form.add_field("timestamp_granularities[]", "word")
+                form.add_field("timestamp_granularities[]", "segment")
             if config.language != "auto":
-                form.add_field("language", config.language)
+                field = "languages[]" if config.model == "gpt-transcribe" else "language"
+                form.add_field(field, config.language)
             if config.prompt:
                 form.add_field("prompt", config.prompt)
             try:
@@ -204,3 +208,11 @@ async def transcribe_audio(audio: Path, config: ASR) -> dict:
                 raise TransientError("Błąd połączenia podczas transkrypcji OpenAI.") from exc
 
     return await retry_network(request)
+
+
+def parse_text(document: dict, *, start: float, end: float) -> list[Cue]:
+    """GPT supplies text only; these approximate bounds come from the audio window."""
+    if not isinstance(document, dict) or not isinstance(document.get("text"), str):
+        raise PermanentError("OpenAI zwróciło niepoprawny tekst transkrypcji.")
+    text = " ".join(document["text"].split())
+    return [Cue(start, end, text)] if text else []

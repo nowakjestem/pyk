@@ -111,15 +111,16 @@ docker compose up -d --force-recreate bot worker
 ```
 
 Domyślnie wysyłamy do `https://api.openai.com/v1/audio/transcriptions` wyłącznie audio
-mono 16 kHz w fragmentach do 300 sekund, raz dla obu wariantów klipu. Nie ma pośrednika.
-Model `whisper-1` zwraca `verbose_json` z czasami słów i segmentów. `gpt-transcribe` nie
-udostępnia czasów słów wymaganych przez ten pipeline; nie można podmienić go samą nazwą
-w YAML. Własne nazwy i pisownię można podać w `asr.prompt`.
+mono 16 kHz, raz dla obu wariantów klipu. Nie ma pośrednika. Model `gpt-transcribe`
+zwraca JSON z samym tekstem; nie żądamy czasów słów ani segmentów. Audio dzielimy na
+krótkie fragmenty, domyślnie około 8 sekund, wybierając pobliskie pauzy. Granice tych
+fragmentów wyznaczają przybliżony czas wyświetlania napisów. Dłuższy tekst jest dzielony
+na krótkie frazy proporcjonalnie do jego długości. To nie jest dokładne dopasowanie
+do wypowiadanych słów. Własne nazwy i pisownię można podać w `asr.prompt`.
 
-OpenAI zapowiada wyłączenie `whisper-1` na **26 lutego 2027**. Przed tą datą backend będzie
-wymagał migracji z zachowaniem synchronizacji napisów. Źródła:
-[OpenAI Docs — transkrypcja i czasy słów](https://developers.openai.com/api/docs/guides/speech-to-text),
-[harmonogram wyłączeń](https://developers.openai.com/api/docs/deprecations).
+Przy cenie 0,0045 USD/min 20 minut tygodniowo oznacza około **0,39 USD miesięcznie**,
+bez ponawianych zapytań. Źródła: [OpenAI — transkrypcja](https://developers.openai.com/api/docs/guides/speech-to-text),
+[model i cena gpt-transcribe](https://developers.openai.com/api/docs/models/gpt-transcribe).
 
 Brak klucza jest wykrywany przed uruchomieniem workera i przy kontroli integracji.
 Błędy autoryzacji i brak środków kończą zadanie czytelnym komunikatem. Błędy połączenia,
@@ -156,7 +157,7 @@ subtitles:
   max_phrase_seconds: 4
   margin_x: 40
   background:
-    mode: word # none | line | word
+    mode: line # none | line | word
     color: '#2563EB'
     opacity: 0.85
     padding: 6
@@ -198,10 +199,12 @@ Samą zmianę stylu w YAML wystarczy zastosować restartem.
 `word` — prostokąt pod aktualnie wypowiadanym pełnym słowem. Tekst całej frazy pozostaje
 nieruchomy, tło znika w przerwach między słowami. `color` używa `#RRGGBB`, `opacity`
 ma zakres 0–1 (1 oznacza nieprzezroczyste), a `padding` to odstęp w pikselach (0–30).
-Obrys i kolor liter są niezależne od tła. Domyślny YAML wybiera Lato i niebieskie tło słowa;
+Obrys i kolor liter są niezależne od tła. Domyślny YAML wybiera Lato i niebieskie tło linijki;
 na czarne tło całej linijki zmień `mode: line` i `color: '#000000'`.
 
-OpenAI zwraca pełne słowa z czasami; aplikacja zachowuje interpunkcję segmentów i dobiera
+Domyślny `gpt-transcribe` nie zwraca czasów słów; używaj `mode: line`. Tryb `word`
+również zadziała, ale użyje tła całej linijki. Opcjonalny `asr.model: whisper-1`
+zwraca pełne słowa z czasami; aplikacja zachowuje interpunkcję segmentów i dobiera
 krótkie frazy według granic słów. W opcjonalnym trybie lokalnym Whisper jest uruchamiany
 z `-ojf`: pełny JSON zawiera czasy tokenów. Aplikacja łączy
 tokeny w słowa z interpunkcją i dobiera frazy według granic tych słów. Są to
@@ -217,20 +220,24 @@ SRT pozostaje zwykłym tekstem; dynamiczne tło znajduje się w ASS i wypalonym 
 Domyślnie źródło jest ograniczone do 1080p; crop z takiego materiału bywa powiększany.
 Zwiększenie rozdzielczości oznacza większy koszt i zużycie pamięci — wymaga ponownego benchmarku.
 
-ASR domyślnie używa OpenAI `whisper-1` i języka `pl`:
+ASR domyślnie używa OpenAI `gpt-transcribe` i języka `pl`:
 
 ```yaml
 asr:
   provider: openai
-  model: whisper-1
+  model: gpt-transcribe
   language: pl
   prompt: ''
+  text_chunk_seconds: 8
   max_chunk_seconds: 300
   request_timeout_seconds: 300
 ```
 
-Audio jest dzielone na maksymalnie pięciominutowe fragmenty z zachowaniem przesunięć czasu.
-Całkowicie ciche fragmenty są pomijane; jakość przy muzyce, szumie i nazwach własnych wymaga
+`max_chunk_seconds` ogranicza długość audio wyodrębnianego jednorazowo na VPS-ie;
+`text_chunk_seconds` ustawia docelową długość zapytań GPT (3–15 sekund). Jeśli pobliska
+pauza występuje do 1,5 sekundy wcześniej, dzielimy w jej środku. Końcówka do 1,5 sekundy
+jest dołączana do poprzedniego fragmentu. Próbki nie są pomijane ani wysyłane dwukrotnie.
+Całkowicie ciche fragmenty nie wymagają zapytania API. Jakość przy muzyce, szumie i nazwach własnych wymaga
 sprawdzenia na własnych nagraniach. Dla angielskiego ustaw `language: en`, dla autodetekcji `auto`.
 
 Dla lokalnego trybu ustaw `asr.provider: local`. Wtedy domyślnie używany jest wielojęzyczny
@@ -238,6 +245,8 @@ Dla lokalnego trybu ustaw `asr.provider: local`. Wtedy domyślnie używany jest 
 `docker compose run --rm -v ./models:/app/models bot model-download`.
 Lokalny model można zmienić przez `model_url` i `model_path`; nie używaj modeli `.en` dla polskiego.
 Zadania zapisane przed dodaniem API zachowują tryb lokalny i nie wymagają klucza OpenAI.
+Zadania przyjęte z modelem `whisper-1` również zachowują swój model. OpenAI zapowiada jego
+wyłączenie na **26 lutego 2027**: [harmonogram wyłączeń](https://developers.openai.com/api/docs/deprecations).
 
 ## CLI, kolejka i odzyskiwanie
 

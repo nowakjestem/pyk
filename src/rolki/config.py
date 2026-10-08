@@ -46,7 +46,8 @@ class Paths(Settings):
 class ASR(Settings):
     # Keep local as the schema default for jobs saved before API support.
     provider: Literal["local", "openai"] = "local"
-    model: Literal["whisper-1"] = "whisper-1"
+    model: Literal["whisper-1", "gpt-transcribe"] = "whisper-1"
+    text_chunk_seconds: int = Field(default=8, ge=3, le=15)
     prompt: str = Field(default="", max_length=1024)
     request_timeout_seconds: int = Field(default=300, ge=10, le=3600)
     binary: str = "whisper-cli"

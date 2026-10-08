@@ -352,7 +352,7 @@ async def test_openai_silence_does_not_call_api(tmp_path, config, monkeypatch):
 def test_provider_validation_legacy_jobs_and_secret_snapshot(config, db, monkeypatch):
     assert Config.model_validate_json(config.model_dump_json()).asr.provider == "local"
     with pytest.raises(ValidationError):
-        ASR(provider="openai", model="gpt-transcribe")  # Does not supply word timestamps.
+        ASR(provider="openai", model="unknown-model")
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     api_config = config.model_copy(
         update={"asr": config.asr.model_copy(update={"provider": "openai"})}

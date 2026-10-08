@@ -12,7 +12,8 @@ paths:
 
 asr:
   provider: openai # local zachowuje obsługę whisper.cpp i starszych zadań
-  model: whisper-1 # tekst + rzeczywiste czasy słów i segmentów w jednym zapytaniu
+  model: gpt-transcribe # sam tekst; czasy wyświetlania wynikają z fragmentów audio
+  text_chunk_seconds: 8 # krótkie fragmenty dzielone w pobliżu pauz
   prompt: '' # opcjonalny słownik nazw własnych, w języku nagrania
   request_timeout_seconds: 300
   language: pl
@@ -43,7 +44,7 @@ subtitles:
   max_phrase_seconds: 4
   margin_x: 40
   background:
-    mode: word # none: bez tła, line: cała linijka, word: aktualne słowo
+    mode: line # none: bez tła, line: cała linijka; word wymaga czasów słów
     color: '#2563EB'
     opacity: 0.85 # 0: przezroczyste, 1: nieprzezroczyste
     padding: 6
