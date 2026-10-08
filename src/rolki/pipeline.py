@@ -10,6 +10,7 @@ from pathlib import Path
 
 from .config import Config
 from .db import Database, acceptance_message
+from .descriptions import generate_description
 from .errors import PermanentError, ResourceWait, TransientError
 from .filenames import clip_filename, current_output_date
 from .media import chapters_for_source, probe, render, transcribe, validate_chapters
@@ -106,6 +107,7 @@ class Pipeline:
             )
             save("source_verified")
 
+        previous_description = None
         for chapter in state["chapters"]:
             index = str(chapter["index"])
             result = state["results"].setdefault(index, {"variants": {}})
@@ -153,7 +155,27 @@ class Pipeline:
                 f"[9:16 — wycięty kadr]({variants['crop']['url']}) · "
                 f"[9:16 — pełny obraz z pasami]({variants['letterbox']['url']})\n\n"
                 f"Pliki są przechowywane przez {config.s3.retention_days} dni.",
+                after_event=previous_description,
             )
+            if config.descriptions.enabled:
+                if "description" not in result:
+                    save(f"describing:{index}")
+                    transcript = " ".join(cue["text"] for cue in result["cues"]).strip()
+                    result["description"] = (
+                        await generate_description(
+                            chapter["title"], transcript, config.descriptions
+                        )
+                        if transcript
+                        else "Brak rozpoznanej mowy — nie wygenerowano opisu tego rozdziału."
+                    )
+                    save(f"described:{index}")
+                previous_description = f"description:{index}"
+                self.db.notify(
+                    job["id"],
+                    previous_description,
+                    result["description"],
+                    after_event=f"chapter:{index}",
+                )
             if chapter_root.exists():
                 shutil.rmtree(chapter_root)
 
@@ -162,6 +184,7 @@ class Pipeline:
             job["id"],
             "complete",
             f"Zadanie `{job['id'][:8]}` zakończone. Gotowych filmów: {len(state['chapters']) * 2}.",
+            after_event=previous_description,
         )
         shutil.rmtree(root)
 

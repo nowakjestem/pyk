@@ -3,6 +3,8 @@
 Bot w prywatnym kanale Mattermosta przyjmuje zwykłe wiadomości z linkiem do YouTube.
 Z każdego rozdziału tworzy dwa MP4 z polskimi napisami: wycięty pionowy kadr oraz pełny
 obraz na pionowym czarnym tle. Publikuje linki S3 w wątku wiadomości źródłowej.
+Po linkach każdego rozdziału wysyła osobną wiadomość z opisem do skopiowania na Instagram/TikTok,
+generowanym z transkrypcji tego rozdziału przez `gpt-6.1-sol` z reasoningiem `low`.
 
 Python 3.12, SQLite, yt-dlp + Deno/EJS, bezpośrednie API OpenAI, FFmpeg/libass i Docker Compose.
 Lokalny whisper.cpp pozostaje opcjonalnym backendem i obsługuje starsze zadania.
@@ -88,6 +90,46 @@ Aktualizacja oczekuje na dostarczenie potwierdzenia i używa
 Bot musi mieć uprawnienie `edit_post`; polityka serwera powinna dopuszczać edycję również
 po dłuższym oczekiwaniu w kolejce. Błąd edycji nie tworzy zastępczego posta. Wyniki
 rozdziałów i zakończenie zadania nadal są publikowane w wątku źródłowym.
+
+### Opisy do Instagram/TikTok
+
+Sekcja `descriptions` w `config.yaml` włącza generowanie **jednego wspólnego opisu
+na rozdział** dla obu wariantów wideo. Używamy bezpośrednio
+[Responses API](https://developers.openai.com/api/docs/guides/reasoning)
+z modelem [`gpt-6.1-sol`](https://developers.openai.com/api/docs/models/gpt-6.1-sol)
+i `reasoning.effort: low`, z tym samym `OPENAI_API_KEY` co do transkrypcji.
+Model otrzymuje tytuł rozdziału i pełny tekst jego transkrypcji; nie otrzymuje treści innych
+rozdziałów, audio ani linku do filmu. Zapytania mają `store: false`.
+
+Domyślny opis jest po polsku: krótki początek, 2–4 zdania i 3–5 hashtagów, do 1800 znaków.
+Styl można zmienić bez edycji kodu:
+
+```yaml
+descriptions:
+  enabled: true
+  model: gpt-6.1-sol
+  reasoning_effort: low
+  max_chars: 1800
+  max_output_tokens: 4096
+  request_timeout_seconds: 300
+  prompt: >-
+    Napisz krótki opis po polsku do Instagram/TikTok na podstawie tego rozdziału.
+    Zacznij od konkretnego zdania, dodaj 2–3 zdania i 3 trafne hashtagi.
+    Nie wymyślaj faktów. Zwróć tylko gotowy tekst bez etykiet i Markdown.
+```
+
+Po zmianie konfiguracji zrestartuj bot i worker. Nowe zadania zapiszą nowe ustawienia;
+zadania utworzone przed dodaniem tej funkcji zachowują wyłączone opisy.
+W wątku kolejność wynosi: **linki rozdziału → osobna wiadomość z samym opisem →
+linki następnego rozdziału → jego opis**. Zależności w trwałej kolejce powiadomień
+zachowują ją przy ponawianiu połączeń. Opis jest zapisywany w checkpointcie przed
+publikacją i nie jest generowany ponownie po restarcie lub ponowieniu zadania.
+
+Brak rozpoznanej mowy nie powoduje zapytania do modelu: bot zamiast opisu podaje krótką
+informację, a klipy nadal powstają. Błąd API opisu pozostawia ukończone klipy dostępne;
+`rolki retry ID` wznawia zadanie bez ponownego uploadu i transkrypcji. Błędy dostarczenia
+postów obsługuje osobno `rolki retry-notifications`. W CLI gotowy opis znajduje się
+również w checkpointcie widocznym przez `rolki job ID`.
 
 ### Konfiguracja S3 i retencji
 

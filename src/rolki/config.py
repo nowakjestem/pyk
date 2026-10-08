@@ -74,6 +74,29 @@ class ASR(Settings):
         return validate_url(value)
 
 
+class Descriptions(Settings):
+    # Existing job snapshots must not start making additional paid requests.
+    enabled: bool = False
+    model: str = Field(default="gpt-6.1-sol", min_length=1, max_length=100)
+    reasoning_effort: Literal["low", "medium", "high", "xhigh", "max"] = "low"
+    request_timeout_seconds: int = Field(default=300, ge=10, le=3600)
+    max_output_tokens: int = Field(default=4096, ge=512, le=16384)
+    max_chars: int = Field(default=1800, ge=100, le=2000)
+    prompt: str = Field(
+        default=(
+            "Napisz po polsku jeden opis do publikacji tego rozdziału jako rolki "
+            "na Instagramie lub TikToku. Zacznij od krótkiego, konkretnego zdania "
+            "przyciągającego uwagę, potem dodaj 2–4 krótkie zdania i 3–5 trafnych hashtagów. "
+            "Pisz naturalnie, bez clickbaitu, bez wymyślonych cytatów i faktów. "
+            "Opinie przedstawiaj jako opinie autora nagrania. "
+            "Zwróć wyłącznie gotowy opis: bez etykiet, komentarzy, cudzysłowów, "
+            "formatowania Markdown ani bloków kodu."
+        ),
+        min_length=1,
+        max_length=8000,
+    )
+
+
 class Video(Settings):
     width: int = Field(default=720, ge=144, le=2160)
     height: int = Field(default=1280, ge=256, le=3840)
@@ -188,6 +211,7 @@ class Config(Settings):
     mattermost: Mattermost = Field(default_factory=Mattermost)
     paths: Paths = Field(default_factory=Paths)
     asr: ASR = Field(default_factory=ASR)
+    descriptions: Descriptions = Field(default_factory=Descriptions)
     video: Video = Field(default_factory=Video)
     subtitles: Subtitles = Field(default_factory=Subtitles)
     s3: S3 = Field(default_factory=S3)
@@ -221,7 +245,9 @@ class Config(Settings):
             raise ValueError("Uzupełnij S3_BUCKET i S3_PUBLIC_BASE_URL.")
 
     def require_asr(self):
-        if self.asr.provider == "openai" and not os.getenv("OPENAI_API_KEY", "").strip():
+        if (self.asr.provider == "openai" or self.descriptions.enabled) and not os.getenv(
+            "OPENAI_API_KEY", ""
+        ).strip():
             raise ValueError("Brak OPENAI_API_KEY w .env.")
 
 

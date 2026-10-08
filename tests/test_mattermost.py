@@ -199,6 +199,54 @@ async def test_notification_recovers_ambiguous_post(db, config, enqueue):
     assert db.pending_notifications() == []
 
 
+async def test_description_waits_for_links_recovery_and_preserves_chapter_order(
+    db, config, enqueue
+):
+    job_id = enqueue()
+    db.notify(job_id, "chapter:0", "Links 0")
+    db.notify(job_id, "description:0", "Opis 0 #temat", after_event="chapter:0")
+    db.notify(job_id, "chapter:1", "Links 1", after_event="description:0")
+    db.notify(job_id, "description:1", "Opis 1 #temat", after_event="chapter:1")
+    db.notify(job_id, "complete", "Complete", after_event="description:1")
+    client = Client()
+    bot = Bot(config, db, client, "ownbot")
+    client.fail_after_send = True
+    await bot.deliver_notification(db.notification_for_event(job_id, "chapter:0"))
+    for event in ("description:0", "chapter:1", "description:1", "complete"):
+        await bot.deliver_notification(db.notification_for_event(job_id, event))
+        assert db.notification_for_event(job_id, event)["attempts"] == 0
+    assert [p["message"] for p in client.sent] == ["Links 0"]
+    client.fail_after_send = False
+    for event in ("chapter:0", "description:0", "chapter:1", "description:1", "complete"):
+        await bot.deliver_notification(db.notification_for_event(job_id, event))
+    assert [p["message"] for p in client.sent] == [
+        "Links 0",
+        "Opis 0 #temat",
+        "Links 1",
+        "Opis 1 #temat",
+        "Complete",
+    ]
+    assert all(p["root_id"] == "root" for p in client.sent)
+
+
+async def test_failed_links_block_description_until_notifications_retried(db, config, enqueue):
+    job_id = enqueue()
+    db.notify(job_id, "chapter:0", "Links")
+    db.notify(job_id, "description:0", "Opis", after_event="chapter:0")
+    links = db.notification_for_event(job_id, "chapter:0")
+    db.notification_attempt(links["id"])
+    db.notification_failed(links["id"], permanent=True)
+    client = Client()
+    bot = Bot(config, db, client, "ownbot")
+    await bot.deliver_notification(db.notification_for_event(job_id, "description:0"))
+    assert client.sent == []
+    assert db.notification_for_event(job_id, "description:0")["status"] == "failed"
+    db.retry_notifications()
+    for event in ("chapter:0", "description:0"):
+        await bot.deliver_notification(db.notification_for_event(job_id, event))
+    assert [p["message"] for p in client.sent] == ["Links", "Opis"]
+
+
 @pytest.mark.parametrize(
     "status,exception",
     [(401, PermanentError), (403, PermanentError), (429, TransientError), (503, TransientError)],

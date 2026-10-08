@@ -24,12 +24,13 @@ CREATE TABLE IF NOT EXISTS outbox (
  id TEXT PRIMARY KEY, job_id TEXT NOT NULL REFERENCES jobs(id), event_key TEXT NOT NULL,
  channel_id TEXT NOT NULL, root_id TEXT NOT NULL, message TEXT NOT NULL,
  status TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0, update_of TEXT,
+ after_event TEXT,
  retry_at REAL NOT NULL DEFAULT 0, post_id TEXT, created_at REAL NOT NULL,
  UNIQUE(job_id, event_key)
 );
 CREATE TABLE IF NOT EXISTS cursors (channel_id TEXT PRIMARY KEY, since_ms INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS runtime (name TEXT PRIMARY KEY, heartbeat REAL NOT NULL, detail TEXT NOT NULL);
-PRAGMA user_version=3;
+PRAGMA user_version=4;
 """
 
 
@@ -45,6 +46,8 @@ class Database:
                 db.execute("ALTER TABLE jobs ADD COLUMN local_output TEXT")
             if "update_of" not in {row[1] for row in db.execute("PRAGMA table_info(outbox)")}:
                 db.execute("ALTER TABLE outbox ADD COLUMN update_of TEXT")
+            if "after_event" not in {row[1] for row in db.execute("PRAGMA table_info(outbox)")}:
+                db.execute("ALTER TABLE outbox ADD COLUMN after_event TEXT")
 
     @contextmanager
     def connect(self, immediate=False):
@@ -64,12 +67,15 @@ class Database:
             db.close()
 
     @staticmethod
-    def _notify(db, job_id, event_key, channel_id, root_id, message, update_of=None):
+    def _notify(
+        db, job_id, event_key, channel_id, root_id, message, update_of=None, after_event=None
+    ):
         if not channel_id:
             return
         db.execute(
             """INSERT OR IGNORE INTO outbox
-            (id,job_id,event_key,channel_id,root_id,message,created_at,update_of) VALUES (?,?,?,?,?,?,?,?)""",
+            (id,job_id,event_key,channel_id,root_id,message,created_at,update_of,after_event)
+            VALUES (?,?,?,?,?,?,?,?,?)""",
             (
                 uuid.uuid4().hex,
                 job_id,
@@ -79,6 +85,7 @@ class Database:
                 message,
                 time.time(),
                 update_of,
+                after_event,
             ),
         )
 
@@ -135,11 +142,26 @@ class Database:
             )
         return job_id
 
-    def notify(self, job_id: str, event_key: str, message: str, *, update_of: str | None = None):
+    def notify(
+        self,
+        job_id: str,
+        event_key: str,
+        message: str,
+        *,
+        update_of: str | None = None,
+        after_event: str | None = None,
+    ):
         with self.connect(immediate=True) as db:
             job = db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
             self._notify(
-                db, job_id, event_key, job["channel_id"], job["root_id"], message, update_of
+                db,
+                job_id,
+                event_key,
+                job["channel_id"],
+                job["root_id"],
+                message,
+                update_of,
+                after_event,
             )
 
     def notification_for_event(self, job_id: str, event_key: str):

@@ -100,3 +100,4 @@ def test_old_outbox_migrates_and_preserves_pending_notifications(tmp_path):
     Database(path)  # Migration is safe on a second startup.
     old = database.pending_notifications()[0]
     assert old["message"] == "legacy" and old["update_of"] is None
+    assert old["after_event"] is None

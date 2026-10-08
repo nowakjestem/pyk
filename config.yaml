@@ -20,6 +20,15 @@ asr:
   language: pl
   max_chunk_seconds: 300
 
+descriptions:
+  enabled: true
+  model: gpt-6.1-sol
+  reasoning_effort: low
+  request_timeout_seconds: 300
+  max_output_tokens: 4096
+  max_chars: 1800
+  # Opcjonalny prompt zmienia styl opisu; domyślnie krótki opis PL + 3–5 hashtagów.
+
 video:
   width: 720
   height: 1280

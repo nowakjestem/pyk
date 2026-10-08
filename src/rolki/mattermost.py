@@ -161,6 +161,15 @@ class Bot:
 
     async def deliver_notification(self, notification: dict):
         try:
+            if notification.get("after_event"):
+                previous = self.db.notification_for_event(
+                    notification["job_id"], notification["after_event"]
+                )
+                if previous is None or previous["status"] == "failed":
+                    self.db.notification_attempt(notification["id"])
+                    raise PermanentError("Nie udało się dostarczyć poprzedniej wiadomości zadania.")
+                if previous["status"] != "sent":
+                    return  # Keep chapter links and their description together, including retries.
             if notification.get("update_of"):
                 original = self.db.notification_for_event(
                     notification["job_id"], notification["update_of"]

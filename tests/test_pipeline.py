@@ -2,6 +2,7 @@ import json
 
 import pytest
 
+from rolki.config import Descriptions
 from rolki.errors import PermanentError, ResourceWait
 from rolki.pipeline import Pipeline
 from rolki.subtitles import Cue, Word
@@ -104,6 +105,75 @@ async def test_pipeline_two_variants_per_chapter(db, config, enqueue, fake_media
     assert "**1**" in started["message"] and job_id[:8] in started["message"]
     assert "Film: Film testowy." in started["message"]
     assert "Rozdziałów: 2. Rozpoczynam przetwarzanie." in started["message"]
+
+
+async def test_descriptions_use_each_transcript_and_resume_without_paid_repeat(
+    db,
+    config,
+    enqueue,
+    fake_media,
+    monkeypatch,
+):
+    calls, _ = fake_media
+    config = config.model_copy(update={"descriptions": Descriptions(enabled=True)})
+    requested = []
+    fail = True
+
+    async def generate(title, transcript, settings):
+        requested.append((title, transcript))
+        assert settings.model == "gpt-6.1-sol" and settings.reasoning_effort == "low"
+        if title == "Drugi" and fail:
+            raise PermanentError("Opis chwilowo niedostępny.")
+        return f"Opis: {title}.\n\n#rozdział"
+
+    monkeypatch.setattr("rolki.pipeline.generate_description", generate)
+    job_id = enqueue(config=config)
+    await execute(db, Pipeline(db), db.claim())
+    assert db.get(job_id)["status"] == "failed"
+    assert db.notification_for_event(job_id, "chapter:1") is not None
+    assert db.notification_for_event(job_id, "description:1") is None
+    assert len(calls["upload"]) == 4
+    fail = False
+    db.retry(job_id)
+    await execute(db, Pipeline(db), db.claim())
+    assert db.get(job_id)["status"] == "done"
+    assert requested == [
+        ("Pierwszy", "Zażółć gęślą jaźń"),
+        ("Drugi", "Zażółć gęślą jaźń"),
+        ("Drugi", "Zażółć gęślą jaźń"),
+    ]
+    assert len(calls["upload"]) == 4 and calls["transcribe"] == 2
+    for index, title in enumerate(("Pierwszy", "Drugi")):
+        post = db.notification_for_event(job_id, f"description:{index}")
+        assert post["message"] == f"Opis: {title}.\n\n#rozdział"
+        assert post["root_id"] == "root" and post["after_event"] == f"chapter:{index}"
+    assert db.notification_for_event(job_id, "chapter:1")["after_event"] == "description:0"
+    assert db.notification_for_event(job_id, "complete")["after_event"] == "description:1"
+    checkpoint = json.loads(db.get(job_id)["checkpoint"])
+    assert checkpoint["results"]["0"]["description"] == "Opis: Pierwszy.\n\n#rozdział"
+
+
+async def test_silent_chapter_publishes_clips_without_inventing_description(
+    db,
+    config,
+    enqueue,
+    fake_media,
+    monkeypatch,
+):
+    config = config.model_copy(update={"descriptions": Descriptions(enabled=True)})
+
+    async def silence(*_):
+        return []
+
+    async def never_call(*_):
+        pytest.fail("No speech must not generate a paid or invented description")
+
+    monkeypatch.setattr("rolki.pipeline.transcribe", silence)
+    monkeypatch.setattr("rolki.pipeline.generate_description", never_call)
+    job_id = enqueue(config=config)
+    await execute(db, Pipeline(db), db.claim())
+    assert db.get(job_id)["status"] == "done"
+    assert "Brak rozpoznanej mowy" in db.notification_for_event(job_id, "description:0")["message"]
 
 
 async def test_resume_partial_upload_no_retranscription(db, enqueue, fake_media, monkeypatch):
