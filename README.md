@@ -171,6 +171,8 @@ subtitles:
 
 Alignment używa numeracji ASS: 1–3 dół, 4–6 środek, 7–9 góra; 2 oznacza dół/środek.
 Marginesy i font_size są liczone w pikselach docelowego obrazu.
+Przy większym foncie zmniejsz `max_chars_per_line`, aby tekst mieścił się w kadrze:
+np. przy Lato 80 px i obrazie 720×1280 punktem wyjścia jest 16 znaków zamiast 26.
 Dla innego formatu źródła lub rozdzielczości wyjściowej dostosuj położenie napisów w wariancie
 z pasami. Napisy są wypalane **po** kadrowaniu.
 

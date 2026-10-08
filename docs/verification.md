@@ -2,8 +2,8 @@
 
 ## Środowisko i testy
 
-- Lokalnie Python 3.12.13, po poprawkach API OpenAI: 144 testy przeszły; 8 testów renderowania pominięto, ponieważ lokalny FFmpeg nie ma libass.
-- Na `narcyz`, nowy obraz Docker z Pythonem 3.12, FFmpeg/libass i whisper.cpp v1.8.7: **152 testy przeszły**. Wcześniejsza poprawka granic rozdziałów miała 114 zaliczonych testów i oba zadania CI zakończone powodzeniem.
+- Lokalnie Python 3.12.13, po dodaniu GPT: 155 testów przeszło; 8 testów renderowania pominięto, ponieważ lokalny FFmpeg nie ma libass.
+- Na `narcyz`, nowy obraz Docker z Pythonem 3.12, FFmpeg/libass i whisper.cpp v1.8.7: **163 testy przeszły**. Oba zadania GitHub Actions dla zmiany GPT (`699114e`) zakończyły się powodzeniem. Wcześniejszy backend OpenAI Whisper miał 152 zaliczone testy.
 - Kontener testowy miał limit **768 MiB RAM, bez swapu, 2 vCPU**.
 - Lint Ruff, formatowanie i sprawdzenie lockfile zależności zakończyły się powodzeniem.
 - Render sprawdzono przez ffprobe, pełne dekodowanie FFmpeg oraz kontrolę pikseli: oba warianty są pionowe, zachowują audio i granice klipu, a wariant letterbox ma czarne pasy i napisy w dolnym pasie.
@@ -112,3 +112,40 @@ transkrypcję i nie wymaga kolejnej opłaty API. Próba sprawdza integrację i r
 nie stanowi pełnej oceny jakości rozpoznawania ani ponownego przetworzenia całego filmu.
 
 Raport, transkrypcja i oba filmy są na VPS-ie w `data/openai-verification/`.
+
+## GPT z samym tekstem
+
+Domyślny YAML i konfigurację VPS-a przełączono na `gpt-transcribe`. Model zwraca tekst,
+bez czasów słów i segmentów. Żądanie używa JSON oraz `languages[]=pl`, a dla tego modelu
+nie zawiera parametrów timestampów. Granice wyświetlania napisów wyznaczają krótkie
+fragmenty audio: domyślnie około 8 sekund, dzielone w pobliżu pauz. Długie wypowiedzi
+są dzielone proporcjonalnie na frazy. Synchronizacja jest przybliżona; nie wykonujemy
+forced alignment ani drugiej transkrypcji Whisperem.
+
+Testy sprawdzają parametry rzeczywistego multipart, tekst bez danych słów, granice
+próbek bez luk i nakładania, dzielenie w pauzie, krótką końcówkę oraz pomijanie ciszy.
+Wznowienie korzysta z atomowo zapisanych odpowiedzi GPT, nie powtarza ukończonego
+zapytania i nie wykorzystuje cache starego modelu. Oba warianty ASS mają tło linijki.
+
+Rzeczywiste API przyjęło żądanie z modelem `gpt-transcribe` i zwróciło polski tekst.
+Następnie przetworzono tę samą 30-sekundową próbkę ludzkiej mowy co wcześniej:
+
+| Etap | Wynik |
+|---|---:|
+| Transkrypcja wraz z wyodrębnieniem audio | 4,58 s |
+| Fragmenty API / słowa z czasami | 4 / 0 |
+| Pierwszy render crop | 9,97 s |
+| Pierwszy render letterbox | 6,12 s |
+| Największy RSS procesu potomnego | 181,83 MiB |
+
+Oba filmy 720×1280 przeszły kontrolę parametrów i pełne dekodowanie. Kontener miał
+768 MiB RAM bez swapu i 2 vCPU. Próba użyła ustawień użytkownika: Lato 80 px,
+tło całej linijki oraz własne marginesy. Kontrola klatek ujawniła wyjście długiego tekstu
+poza kadr; na VPS-ie zmniejszono `max_chars_per_line` z 26 do 16, zachowując rozmiar
+fontu. Ponowny render korzystał wyłącznie z zapisanej transkrypcji; wizualnie sprawdzone
+klatki crop i letterbox mają czytelne napisy mieszczące się w kadrze.
+
+Zadania przyjęte wcześniej zachowują model i styl z własnych snapshotów. Kolejkę
+wstrzymano na czas próby renderowania, a następnie wznowiono. Test nie stanowi
+pełnej oceny jakości GPT ani dokładności synchronizacji całego filmu.
+Raport, transkrypcja i oba filmy: `data/gpt-verification/` na VPS-ie.
