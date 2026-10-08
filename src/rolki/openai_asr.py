@@ -4,6 +4,8 @@ import json
 import math
 import os
 import re
+from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 
 import aiohttp
@@ -15,6 +17,20 @@ from .subtitles import Cue, Word
 
 ENDPOINT = "https://api.openai.com/v1/audio/transcriptions"
 MAX_UPLOAD_BYTES = 24_000_000
+
+
+def retry_after_seconds(value: str | None) -> float:
+    if not value:
+        return 0
+    try:
+        delay = float(value)
+    except ValueError:
+        try:
+            date = parsedate_to_datetime(value)
+            delay = (date - datetime.now(UTC)).total_seconds()
+        except (ValueError, TypeError, OverflowError):
+            return 0
+    return max(0, delay) if math.isfinite(delay) else 0
 
 
 def _times(item: dict, duration: float) -> tuple[float, float]:
@@ -179,7 +195,10 @@ async def transcribe_audio(audio: Path, config: ASR) -> dict:
                                     raise PermanentError(message)
                         if response.status in (408, 409, 429) or response.status >= 500:
                             raise TransientError(
-                                f"OpenAI jest chwilowo niedostępne (HTTP {response.status})."
+                                f"OpenAI jest chwilowo niedostępne (HTTP {response.status}).",
+                                retry_after=retry_after_seconds(
+                                    response.headers.get("Retry-After")
+                                ),
                             )
                         if response.status in (401, 403):
                             raise PermanentError("OpenAI odrzuciło klucz API lub jego uprawnienia.")

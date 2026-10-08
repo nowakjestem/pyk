@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import math
 import struct
@@ -163,39 +164,58 @@ def text_audio_windows(path: Path, target_seconds: int) -> list[tuple[int, int]]
 async def transcribe_text_windows(
     audio: Path, root: Path, config: Config, offset: float, duration: float
 ) -> list[Cue]:
-    cues = []
-    window_audio = root / "text-window.wav"
-    with wave.open(str(audio), "rb") as source:
-        rate = source.getframerate()
-        for first, last in text_audio_windows(audio, config.asr.text_chunk_seconds):
-            start, end = offset + first / rate, offset + min(duration, last / rate)
-            cache = root / f"gpt-transcribe-{round(start * rate):010}.json"
-            try:
-                if cache.is_file():
-                    try:
-                        document = json.loads(cache.read_text(encoding="utf-8"))
-                    except ValueError as exc:
-                        raise PermanentError(
-                            "Niepoprawny zapis transkrypcji GPT na dysku."
-                        ) from exc
-                else:
+    rate = 16000
+    windows = text_audio_windows(audio, config.asr.text_chunk_seconds)
+    pending = iter(enumerate(windows))
+    results: list[list[Cue]] = [[] for _ in windows]
+
+    async def transcribe_window(first: int, last: int) -> list[Cue]:
+        start, end = offset + first / rate, offset + min(duration, last / rate)
+        cache = root / f"gpt-transcribe-{round(start * rate):010}.json"
+        window_audio = root / f"text-window-{round(start * rate):010}.wav"
+        try:
+            if cache.is_file():
+                try:
+                    document = json.loads(cache.read_text(encoding="utf-8"))
+                except ValueError as exc:
+                    raise PermanentError("Niepoprawny zapis transkrypcji GPT na dysku.") from exc
+            else:
+                # Separate input handles and files prevent concurrent seeks/overwrites.
+                with wave.open(str(audio), "rb") as source:
                     source.setpos(first)
                     with wave.open(str(window_audio), "wb") as output:
                         output.setparams(source.getparams())
                         output.writeframes(source.readframes(last - first))
-                    if silent_audio(window_audio):
-                        document = {"text": ""}
-                    else:
-                        document = await transcribe_audio(window_audio, config.asr)
-                chunk_cues = parse_text(document, start=start, end=end)
-                if not cache.is_file():
-                    temporary = cache.with_suffix(".part.json")
-                    temporary.write_text(json.dumps(document, ensure_ascii=False), encoding="utf-8")
-                    temporary.replace(cache)
-                cues.extend(chunk_cues)
-            finally:
-                window_audio.unlink(missing_ok=True)
-    return cues
+                if silent_audio(window_audio):
+                    document = {"text": ""}
+                else:
+                    document = await transcribe_audio(window_audio, config.asr)
+            chunk_cues = parse_text(document, start=start, end=end)
+            if not cache.is_file():
+                temporary = cache.with_suffix(".part.json")
+                temporary.write_text(json.dumps(document, ensure_ascii=False), encoding="utf-8")
+                temporary.replace(cache)
+            return chunk_cues
+        finally:
+            window_audio.unlink(missing_ok=True)
+
+    async def worker():
+        for index, (first, last) in pending:
+            results[index] = await transcribe_window(first, last)
+
+    # Only N workers/files are live, even for hundreds of short audio windows.
+    tasks = [
+        asyncio.create_task(worker()) for _ in range(min(config.asr.concurrency, len(windows)))
+    ]
+    try:
+        await asyncio.gather(*tasks)
+    except BaseException:
+        # Drain cancellations before the caller deletes audio or retries the chapter.
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
+    return [cue for chunk in results for cue in chunk]
 
 
 async def transcribe(source: Path, chapter: dict, root: Path, config: Config) -> list[Cue]:

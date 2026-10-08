@@ -14,6 +14,7 @@ asr:
   provider: openai # local zachowuje obsługę whisper.cpp i starszych zadań
   model: gpt-transcribe # sam tekst; czasy wyświetlania wynikają z fragmentów audio
   text_chunk_seconds: 8 # krótkie fragmenty dzielone w pobliżu pauz
+  concurrency: 3 # równoległe zapytania GPT; renderowanie pozostaje sekwencyjne
   prompt: '' # opcjonalny słownik nazw własnych, w języku nagrania
   request_timeout_seconds: 300
   language: pl

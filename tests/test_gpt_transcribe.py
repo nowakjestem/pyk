@@ -1,3 +1,4 @@
+import asyncio
 import json
 import struct
 import wave
@@ -107,7 +108,7 @@ async def test_gpt_chunks_resume_without_whisper_cache_or_paid_duplicates(
     async def request(path, _config):
         nonlocal calls
         calls += 1
-        assert path.name == "text-window.wav"
+        assert path.name.startswith("text-window-")
         if calls == 2 and failing:
             raise TransientError("temporary")
         return {"text": "Nowy tekst GPT."}
@@ -115,12 +116,12 @@ async def test_gpt_chunks_resume_without_whisper_cache_or_paid_duplicates(
     monkeypatch.setattr(media, "transcribe_audio", request)
     with pytest.raises(TransientError):
         await media.transcribe_text_windows(audio, tmp_path, config, 300, 17)
-    assert not (tmp_path / "text-window.wav").exists()
+    assert not list(tmp_path.glob("text-window-*.wav"))
     failing = False
     cues = await media.transcribe_text_windows(audio, tmp_path, config, 300, 17)
     assert calls == 3
     assert cues == [Cue(300, 308, "Nowy tekst GPT."), Cue(308, 317, "Nowy tekst GPT.")]
-    assert not (tmp_path / "text-window.wav").exists()
+    assert not list(tmp_path.glob("text-window-*.wav"))
 
 
 async def test_gpt_pipeline_dispatch_does_not_use_whisper_parser(tmp_path, config, monkeypatch):
@@ -163,3 +164,115 @@ async def test_silent_windows_are_cached_without_api(tmp_path, config, monkeypat
     monkeypatch.setattr(media, "transcribe_audio", never)
     assert await media.transcribe_text_windows(audio, tmp_path, config, 0, 8) == []
     assert json.loads((tmp_path / "gpt-transcribe-0000000000.json").read_text()) == {"text": ""}
+
+
+async def test_parallel_windows_limit_order_and_isolated_audio(tmp_path, config, monkeypatch):
+    config = config.model_copy(update={"asr": config.asr.model_copy(update={"concurrency": 2})})
+    audio = tmp_path / "audio.wav"
+    with wave.open(str(audio), "wb") as output:
+        output.setparams((1, 2, 16000, 0, "NONE", "not compressed"))
+        for index in range(4):
+            output.writeframesraw(struct.pack("<h", 1000 * (index + 1)) * 128000)
+    second_done, release_first = asyncio.Event(), asyncio.Event()
+    active = peak = 0
+    completed = []
+
+    async def request(path, _):
+        nonlocal active, peak
+        index = int(path.stem.rsplit("-", 1)[1]) // 128000
+        active += 1
+        peak = max(peak, active)
+        assert len(list(tmp_path.glob("text-window-*.wav"))) <= 2
+        try:
+            if index == 0:
+                await second_done.wait()
+                await release_first.wait()
+            elif index == 1:
+                second_done.set()
+            elif index == 2:
+                release_first.set()
+            with wave.open(str(path), "rb") as segment:
+                assert segment.getnframes() == 128000
+                assert struct.unpack("<h", segment.readframes(1))[0] == 1000 * (index + 1)
+            completed.append(index)
+            return {"text": f"Fragment {index}."}
+        finally:
+            active -= 1
+
+    monkeypatch.setattr(media, "transcribe_audio", request)
+    cues = await asyncio.wait_for(media.transcribe_text_windows(audio, tmp_path, config, 0, 32), 2)
+    assert peak == 2 and completed[0] == 1
+    assert cues == [Cue(index * 8, (index + 1) * 8, f"Fragment {index}.") for index in range(4)]
+    assert len(list(tmp_path.glob("gpt-transcribe-*.json"))) == 4
+    assert not list(tmp_path.glob("text-window-*.wav"))
+
+
+async def test_parallel_failure_drains_tasks_and_reuses_completed_cache(
+    tmp_path, config, monkeypatch
+):
+    config = config.model_copy(update={"asr": config.asr.model_copy(update={"concurrency": 3})})
+    audio = tmp_path / "audio.wav"
+    pcm(audio, 24)
+    second_done, cancelled = asyncio.Event(), asyncio.Event()
+
+    async def request(path, _):
+        index = int(path.stem.rsplit("-", 1)[1]) // 128000
+        if index == 1:
+            second_done.set()
+            return {"text": "Fragment 1."}
+        await second_done.wait()
+        if index == 2:
+            raise PermanentError("API failure")
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    monkeypatch.setattr(media, "transcribe_audio", request)
+    with pytest.raises(PermanentError, match="API failure"):
+        await asyncio.wait_for(media.transcribe_text_windows(audio, tmp_path, config, 0, 24), 2)
+    assert cancelled.is_set()
+    assert not list(tmp_path.glob("text-window-*.wav"))
+    assert len(list(tmp_path.glob("gpt-transcribe-*.json"))) == 1
+    requested = []
+
+    async def retry(path, _):
+        index = int(path.stem.rsplit("-", 1)[1]) // 128000
+        requested.append(index)
+        return {"text": f"Fragment {index}."}
+
+    monkeypatch.setattr(media, "transcribe_audio", retry)
+    cues = await media.transcribe_text_windows(audio, tmp_path, config, 0, 24)
+    assert requested == [0, 2]  # The second fragment completed before the first.
+    assert cues == [Cue(index * 8, (index + 1) * 8, f"Fragment {index}.") for index in range(3)]
+
+
+async def test_parallel_cancellation_waits_for_cleanup(tmp_path, config, monkeypatch):
+    config = config.model_copy(update={"asr": config.asr.model_copy(update={"concurrency": 2})})
+    audio = tmp_path / "audio.wav"
+    pcm(audio, 24)
+    both_started = asyncio.Event()
+    active = 0
+
+    async def request(*_):
+        nonlocal active
+        active += 1
+        if active == 2:
+            both_started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            active -= 1
+
+    monkeypatch.setattr(media, "transcribe_audio", request)
+    task = asyncio.create_task(media.transcribe_text_windows(audio, tmp_path, config, 0, 24))
+    try:
+        await asyncio.wait_for(both_started.wait(), 2)
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    assert active == 0
+    assert not list(tmp_path.glob("text-window-*.wav"))
+    assert not list(tmp_path.glob("gpt-transcribe-*.json"))

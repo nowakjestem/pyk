@@ -70,7 +70,7 @@ async def retry_network(operation, attempts=3):
     for attempt in range(attempts):
         try:
             return await operation()
-        except TransientError:
+        except TransientError as exc:
             if attempt + 1 == attempts:
                 raise
-            await asyncio.sleep(2**attempt)
+            await asyncio.sleep(max(2**attempt, exc.retry_after))

@@ -1,6 +1,8 @@
 import asyncio
 import json
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime, timedelta
+from email.utils import format_datetime
 
 import pytest
 from aiohttp import web
@@ -9,7 +11,7 @@ from pydantic import ValidationError
 from rolki import media, openai_asr
 from rolki.config import ASR, Config
 from rolki.errors import PermanentError, TransientError
-from rolki.openai_asr import parse_openai, transcribe_audio
+from rolki.openai_asr import parse_openai, retry_after_seconds, transcribe_audio
 from rolki.subtitles import Cue, Word, cue_from_dict, write_subtitles
 
 
@@ -165,6 +167,50 @@ async def test_multipart_fields_and_retries_reopen_same_audio(tmp_path, monkeypa
     assert ("timestamp_granularities[]", b"word", None) in fields
     assert ("timestamp_granularities[]", b"segment", None) in fields
     assert ("prompt", "Zażółć".encode(), None) in fields
+
+
+async def test_rate_limit_follows_retry_after(tmp_path, monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "test-api-key")
+    audio = tmp_path / "audio.wav"
+    audio.write_bytes(b"audio-body")
+    calls, delays = 0, []
+
+    async def handler(request):
+        nonlocal calls
+        await request.read()
+        calls += 1
+        if calls == 1:
+            return web.json_response(
+                {"error": {"code": "rate_limit_exceeded"}},
+                status=429,
+                headers={"Retry-After": "7.5"},
+            )
+        return web.json_response(transcript())
+
+    async def sleep(delay):
+        if delay > 0:  # aiohttp also yields with sleep(0) when closing sessions.
+            delays.append(delay)
+
+    monkeypatch.setattr("rolki.process.asyncio.sleep", sleep)
+    async with server(handler, monkeypatch):
+        assert await transcribe_audio(audio, ASR(provider="openai")) == transcript()
+    assert delays == [7.5] and calls == 2
+
+
+@pytest.mark.parametrize("header", [None, "bad", "nan", "inf", "-5"])
+def test_invalid_retry_after_uses_backoff(header):
+    assert retry_after_seconds(header) == 0
+
+
+def test_retry_after_http_date():
+    header = format_datetime(datetime.now(UTC) + timedelta(seconds=30), usegmt=True)
+    assert 28 <= retry_after_seconds(header) <= 30
+
+
+@pytest.mark.parametrize("concurrency", [0, 9])
+def test_invalid_api_concurrency(concurrency):
+    with pytest.raises(ValidationError):
+        ASR(concurrency=concurrency)
 
 
 @pytest.mark.parametrize(

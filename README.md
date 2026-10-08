@@ -124,7 +124,9 @@ bez ponawianych zapytań. Źródła: [OpenAI — transkrypcja](https://developer
 
 Brak klucza jest wykrywany przed uruchomieniem workera i przy kontroli integracji.
 Błędy autoryzacji i brak środków kończą zadanie czytelnym komunikatem. Błędy połączenia,
-limit chwilowy i błędy serwera mają maksymalnie trzy próby. Surowe odpowiedzi błędów API
+limit chwilowy i błędy serwera mają maksymalnie trzy próby. Retry uwzględnia `Retry-After`
+(sekundy lub datę HTTP); bez poprawnej wskazówki stosuje rosnące opóźnienie.
+Surowe odpowiedzi błędów API
 nie są publikowane. Rozpoznane fragmenty są zapisywane atomowo w katalogu rozdziału;
 wznowienie wykorzystuje je zamiast powtarzać płatne zapytania. Utrata połączenia po
 przyjęciu żądania przez OpenAI może mimo to prowadzić do ponownego naliczenia opłaty.
@@ -231,6 +233,7 @@ asr:
   language: pl
   prompt: ''
   text_chunk_seconds: 8
+  concurrency: 3
   max_chunk_seconds: 300
   request_timeout_seconds: 300
 ```
@@ -241,6 +244,15 @@ pauza występuje do 1,5 sekundy wcześniej, dzielimy w jej środku. Końcówka d
 jest dołączana do poprzedniego fragmentu. Próbki nie są pomijane ani wysyłane dwukrotnie.
 Całkowicie ciche fragmenty nie wymagają zapytania API. Jakość przy muzyce, szumie i nazwach własnych wymaga
 sprawdzenia na własnych nagraniach. Dla angielskiego ustaw `language: en`, dla autodetekcji `auto`.
+
+`asr.concurrency` ogranicza liczbę równoległych zapytań GPT w rozdziale (1–8, domyślny
+YAML: 3). Odpowiedzi są zapisywane osobno i składane w kolejności audio. Błąd lub
+przerwanie zadania anuluje pozostałe zapytania i sprząta ich pliki; ukończone odpowiedzi
+pozostają dostępne przy wznowieniu. W tym samym czasie istnieje najwyżej tyle plików
+audio, ile wynosi limit. Renderowanie i zadania kolejki nadal są wykonywane kolejno.
+Starsze snapshoty bez tego ustawienia zachowują jedno zapytanie naraz. Ograniczenie
+współbieżności nie zastępuje limitu żądań na minutę; w razie błędów 429 zmniejsz tę wartość.
+[OpenAI Docs — limity i ponawianie](https://developers.openai.com/api/docs/guides/rate-limits).
 
 Dla lokalnego trybu ustaw `asr.provider: local`. Wtedy domyślnie używany jest wielojęzyczny
 `base` Q5_0 i dwa wątki. Pobierz model przez

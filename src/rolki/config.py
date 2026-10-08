@@ -48,6 +48,7 @@ class ASR(Settings):
     provider: Literal["local", "openai"] = "local"
     model: Literal["whisper-1", "gpt-transcribe"] = "whisper-1"
     text_chunk_seconds: int = Field(default=8, ge=3, le=15)
+    concurrency: int = Field(default=1, ge=1, le=8)
     prompt: str = Field(default="", max_length=1024)
     request_timeout_seconds: int = Field(default=300, ge=10, le=3600)
     binary: str = "whisper-cli"
