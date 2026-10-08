@@ -23,13 +23,13 @@ CREATE INDEX IF NOT EXISTS jobs_queue ON jobs(status, retry_at, created_at);
 CREATE TABLE IF NOT EXISTS outbox (
  id TEXT PRIMARY KEY, job_id TEXT NOT NULL REFERENCES jobs(id), event_key TEXT NOT NULL,
  channel_id TEXT NOT NULL, root_id TEXT NOT NULL, message TEXT NOT NULL,
- status TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0,
+ status TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0, update_of TEXT,
  retry_at REAL NOT NULL DEFAULT 0, post_id TEXT, created_at REAL NOT NULL,
  UNIQUE(job_id, event_key)
 );
 CREATE TABLE IF NOT EXISTS cursors (channel_id TEXT PRIMARY KEY, since_ms INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS runtime (name TEXT PRIMARY KEY, heartbeat REAL NOT NULL, detail TEXT NOT NULL);
-PRAGMA user_version=2;
+PRAGMA user_version=3;
 """
 
 
@@ -42,6 +42,8 @@ class Database:
             db.executescript(SCHEMA)
             if "local_output" not in {row[1] for row in db.execute("PRAGMA table_info(jobs)")}:
                 db.execute("ALTER TABLE jobs ADD COLUMN local_output TEXT")
+            if "update_of" not in {row[1] for row in db.execute("PRAGMA table_info(outbox)")}:
+                db.execute("ALTER TABLE outbox ADD COLUMN update_of TEXT")
 
     @contextmanager
     def connect(self, immediate=False):
@@ -61,13 +63,22 @@ class Database:
             db.close()
 
     @staticmethod
-    def _notify(db, job_id, event_key, channel_id, root_id, message):
+    def _notify(db, job_id, event_key, channel_id, root_id, message, update_of=None):
         if not channel_id:
             return
         db.execute(
             """INSERT OR IGNORE INTO outbox
-            (id,job_id,event_key,channel_id,root_id,message,created_at) VALUES (?,?,?,?,?,?,?)""",
-            (uuid.uuid4().hex, job_id, event_key, channel_id, root_id, message, time.time()),
+            (id,job_id,event_key,channel_id,root_id,message,created_at,update_of) VALUES (?,?,?,?,?,?,?,?)""",
+            (
+                uuid.uuid4().hex,
+                job_id,
+                event_key,
+                channel_id,
+                root_id,
+                message,
+                time.time(),
+                update_of,
+            ),
         )
 
     def enqueue(
@@ -81,13 +92,21 @@ class Database:
         root_id="",
         local_output=None,
     ):
-        now = time.time()
         job_id = uuid.uuid4().hex
         with self.connect(immediate=True) as db:
+            now = time.time()
+            position = (
+                1
+                + db.execute(
+                    """SELECT count(*) FROM jobs WHERE status IN ('queued','running','waiting')
+                   AND local_output IS NULL"""
+                ).fetchone()[0]
+            )
+            checkpoint = {"queue_position": position} if channel_id else {}
             inserted = db.execute(
                 """INSERT OR IGNORE INTO jobs
-                (id,post_id,video_id,url,channel_id,root_id,config_json,config_revision,created_at,updated_at,local_output)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                (id,post_id,video_id,url,channel_id,root_id,config_json,config_revision,created_at,updated_at,local_output,checkpoint)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     job_id,
                     post_id,
@@ -100,6 +119,7 @@ class Database:
                     now,
                     now,
                     str(local_output) if local_output else None,
+                    json.dumps(checkpoint),
                 ),
             ).rowcount
             if not inserted:
@@ -110,14 +130,23 @@ class Database:
                 "accepted",
                 channel_id,
                 root_id,
-                f"Przyjęto film do kolejki. Zadanie `{job_id[:8]}`. Przygotuję oba warianty 9:16 z rozdziałów.",
+                acceptance_message(job_id, position),
             )
         return job_id
 
-    def notify(self, job_id: str, event_key: str, message: str):
+    def notify(self, job_id: str, event_key: str, message: str, *, update_of: str | None = None):
         with self.connect(immediate=True) as db:
             job = db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
-            self._notify(db, job_id, event_key, job["channel_id"], job["root_id"], message)
+            self._notify(
+                db, job_id, event_key, job["channel_id"], job["root_id"], message, update_of
+            )
+
+    def notification_for_event(self, job_id: str, event_key: str):
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT * FROM outbox WHERE job_id=? AND event_key=?", (job_id, event_key)
+            ).fetchone()
+            return dict(row) if row else None
 
     def claim(self, job_id=None):
         with self.connect(immediate=True) as db:
@@ -254,3 +283,8 @@ class Database:
                 "SELECT count(*) FROM outbox WHERE status='failed'"
             ).fetchone()[0]
         return {"runtime": runtime, "failed_notifications": failed_notifications}
+
+
+def acceptance_message(job_id: str, position: int | None = None) -> str:
+    place = f" Miejsce w kolejce przy przyjęciu: **{position}**." if position else ""
+    return f"Przyjęto film do kolejki.{place} Zadanie `{job_id[:8]}`."

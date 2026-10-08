@@ -9,7 +9,7 @@ from dataclasses import asdict
 from pathlib import Path
 
 from .config import Config
-from .db import Database
+from .db import Database, acceptance_message
 from .errors import PermanentError, ResourceWait, TransientError
 from .media import chapters_for_source, probe, render, transcribe, validate_chapters
 from .process import retry_network, run_process
@@ -73,11 +73,15 @@ class Pipeline:
             state["duration"] = metadata["duration"]
             state["results"] = {}
             save("metadata_done")
-            self.db.notify(
-                job["id"],
-                "metadata",
-                f"Film: {safe_markdown(state['title'])}. Rozdziałów: {len(state['chapters'])}. Rozpoczynam przetwarzanie.",
-            )
+
+        self.db.notify(
+            job["id"],
+            "metadata",
+            f"{acceptance_message(job['id'], state.get('queue_position'))}\n\n"
+            f"Film: {safe_markdown(state['title'])}.\n"
+            f"Rozdziałów: {len(state['chapters'])}. Rozpoczynam przetwarzanie.",
+            update_of="accepted",
+        )
 
         pending = any(
             len(state["results"].get(str(c["index"]), {}).get("variants", {})) < 2

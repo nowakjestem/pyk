@@ -92,6 +92,11 @@ async def test_pipeline_two_variants_per_chapter(db, config, enqueue, fake_media
     messages = db.pending_notifications()
     assert len(messages) == 5
     assert all(message["root_id"] == "root" for message in messages)
+    started = next(message for message in messages if message["event_key"] == "metadata")
+    assert started["update_of"] == "accepted"
+    assert "**1**" in started["message"] and job_id[:8] in started["message"]
+    assert "Film: Film testowy." in started["message"]
+    assert "Rozdziałów: 2. Rozpoczynam przetwarzanie." in started["message"]
 
 
 async def test_resume_partial_upload_no_retranscription(db, enqueue, fake_media):

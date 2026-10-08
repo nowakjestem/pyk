@@ -1,3 +1,5 @@
+import json
+import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
@@ -58,3 +60,40 @@ def test_worker_does_not_take_local_cli_jobs(db, config, enqueue):
     local_id = enqueue(local_output=config.paths.output_dir)
     assert db.claim() is None
     assert db.claim(local_id)["id"] == local_id
+
+
+def test_queue_position_counts_active_jobs_but_not_finished_or_local(db, config, enqueue):
+    first = enqueue(post_id="first")
+    db.claim()
+    second = enqueue(post_id="second")
+    db.finish(second, "waiting", retry_at=9999999999)
+    finished = enqueue(post_id="done")
+    db.finish(finished, "done")
+    failed = enqueue(post_id="failed")
+    db.finish(failed, "failed")
+    enqueue(post_id="local", local_output=config.paths.output_dir)
+    third = enqueue(post_id="third")
+    assert json.loads(db.get(first)["checkpoint"])["queue_position"] == 1
+    assert json.loads(db.get(second)["checkpoint"])["queue_position"] == 2
+    assert json.loads(db.get(third)["checkpoint"])["queue_position"] == 3
+    assert "**3**" in db.notification_for_event(third, "accepted")["message"]
+    assert enqueue(post_id="third") is None
+
+
+def test_old_outbox_migrates_and_preserves_pending_notifications(tmp_path):
+    path = tmp_path / "legacy.sqlite"
+    with sqlite3.connect(path) as connection:
+        connection.executescript("""
+        CREATE TABLE outbox (
+          id TEXT PRIMARY KEY, job_id TEXT, event_key TEXT, channel_id TEXT, root_id TEXT,
+          message TEXT, status TEXT DEFAULT 'pending', attempts INTEGER DEFAULT 0,
+          retry_at REAL DEFAULT 0, post_id TEXT, created_at REAL,
+          UNIQUE(job_id, event_key)
+        );
+        INSERT INTO outbox (id, job_id, event_key, message, created_at)
+          VALUES ('old', 'job', 'accepted', 'legacy', 0);
+        """)
+    database = Database(path)
+    Database(path)  # Migration is safe on a second startup.
+    old = database.pending_notifications()[0]
+    assert old["message"] == "legacy" and old["update_of"] is None

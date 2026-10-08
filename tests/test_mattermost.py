@@ -29,6 +29,7 @@ class Client:
         self.posts = posts or []
         self.sent = []
         self.fail_after_send = False
+        self.edits = []
 
     async def get(self, path, params=None):
         if path.startswith("/users/"):
@@ -44,7 +45,15 @@ class Client:
         selected = ordered[: int(params["per_page"])]
         return {"order": [p["id"] for p in selected], "posts": {p["id"]: p for p in selected}}
 
-    async def request(self, _method, _path, json):
+    async def request(self, method, path, json):
+        if method == "PUT":
+            post_id = path.split("/")[2]
+            result = next(p for p in self.sent if p["id"] == post_id)
+            result.update(json)
+            self.edits.append((path, json))
+            if self.fail_after_send:
+                raise TransientError("Connection lost after editing")
+            return result
         result = {"id": f"reply-{len(self.sent)}"} | json
         self.sent.append(result)
         if self.fail_after_send:
@@ -56,8 +65,9 @@ async def test_private_channel_thread_and_dedup(db, config):
     bot = Bot(config, db, Client(), "ownbot")
     await bot.handle_post(post(1, root_id="existing-thread"))
     await bot.handle_post(post(1))
+    await bot.handle_post(post(1))
     assert len(db.list_jobs()) == 1
-    assert db.pending_notifications()[0]["root_id"] == "existing-thread"
+    assert db.pending_notifications()[0]["root_id"] == "1"
 
 
 @pytest.mark.parametrize(
@@ -69,6 +79,7 @@ async def test_private_channel_thread_and_dedup(db, config):
         {"props": {"from_webhook": "true"}},
         {"type": "system_join_channel"},
         {"delete_at": 1},
+        {"root_id": "thread-root"},
     ],
 )
 async def test_ignore_bots_and_unrelated_posts(db, config, changes):
@@ -108,6 +119,67 @@ async def test_websocket_out_of_order_cannot_skip_backfill(db, config):
     assert db.cursor("private") == 1000
     await bot.reconcile_channel("private")
     assert len(db.list_jobs()) == 2
+
+
+async def test_backfill_ignores_thread_replies_and_advances_cursor(db, config):
+    client = Client([post(2, root_id="thread-root"), post(3)])
+    db.set_cursor("private", 1000)
+    bot = Bot(config, db, client, "ownbot")
+    await bot.reconcile_channel("private")
+    assert len(db.list_jobs()) == 1
+    assert db.get(db.list_jobs()[0]["id"])["post_id"] == "3"
+    assert db.cursor("private") == 3000
+
+
+async def test_start_message_is_edited_not_posted_twice(db, config, enqueue):
+    job_id = enqueue()
+    client = Client()
+    bot = Bot(config, db, client, "ownbot")
+    original = db.notification_for_event(job_id, "accepted")
+    await bot.deliver_notification(original)
+    db.notify(job_id, "metadata", "Film: Zażółć. Rozdziałów: 2.", update_of="accepted")
+    edit = db.notification_for_event(job_id, "metadata")
+    client.fail_after_send = True
+    await bot.deliver_notification(edit)
+    client.fail_after_send = False
+    retry = db.notification_for_event(job_id, "metadata")
+    await bot.deliver_notification(retry)
+    assert len(client.sent) == 1
+    assert client.sent[0]["message"] == "Film: Zażółć. Rozdziałów: 2."
+    assert client.sent[0]["root_id"] == "root"
+    assert client.sent[0]["props"]["rolki_event"] == original["id"]
+    assert db.notification_for_event(job_id, "metadata")["post_id"] == client.sent[0]["id"]
+    assert db.pending_notifications() == []
+
+
+async def test_edit_waits_for_ambiguous_confirmation_recovery(db, config, enqueue):
+    job_id = enqueue()
+    client = Client()
+    bot = Bot(config, db, client, "ownbot")
+    client.fail_after_send = True
+    await bot.deliver_notification(db.notification_for_event(job_id, "accepted"))
+    db.notify(job_id, "metadata", "Full metadata", update_of="accepted")
+    await bot.deliver_notification(db.notification_for_event(job_id, "metadata"))
+    assert client.edits == []
+    assert db.notification_for_event(job_id, "metadata")["attempts"] == 0
+    client.fail_after_send = False
+    await bot.deliver_notification(db.notification_for_event(job_id, "accepted"))
+    await bot.deliver_notification(db.notification_for_event(job_id, "metadata"))
+    assert len(client.sent) == 1 and client.sent[0]["message"] == "Full metadata"
+    assert db.pending_notifications() == []
+
+
+async def test_edit_failure_never_falls_back_to_new_post(db, config, enqueue):
+    job_id = enqueue()
+    client = Client()
+    bot = Bot(config, db, client, "ownbot")
+    original = db.notification_for_event(job_id, "accepted")
+    db.notification_attempt(original["id"])
+    db.notification_failed(original["id"], permanent=True)
+    db.notify(job_id, "metadata", "Full metadata", update_of="accepted")
+    await bot.deliver_notification(db.notification_for_event(job_id, "metadata"))
+    assert client.sent == [] and client.edits == []
+    assert db.notification_for_event(job_id, "metadata")["status"] == "failed"
 
 
 async def test_notification_recovers_ambiguous_post(db, config, enqueue):

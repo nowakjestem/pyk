@@ -75,6 +75,7 @@ class Bot:
             return
         if (
             post.get("user_id") == self.own_id
+            or post.get("root_id")
             or post.get("delete_at")
             or post.get("type")
             or post.get("props", {}).get("from_webhook")
@@ -99,7 +100,7 @@ class Bot:
                 url=url,
                 config=self.config,
                 channel_id=post["channel_id"],
-                root_id=post.get("root_id") or post["id"],
+                root_id=post["id"],
             )
         # Only reconciliation advances the cursor. Advancing it here could skip earlier
         # messages if WebSocket frames arrive out of order or while backfill is running.
@@ -160,6 +161,23 @@ class Bot:
 
     async def deliver_notification(self, notification: dict):
         try:
+            if notification.get("update_of"):
+                original = self.db.notification_for_event(
+                    notification["job_id"], notification["update_of"]
+                )
+                if original is None or original["status"] == "failed":
+                    self.db.notification_attempt(notification["id"])
+                    raise PermanentError("Nie udało się dostarczyć potwierdzenia zadania.")
+                if original["status"] != "sent" or not original["post_id"]:
+                    return  # Wait for POST success or recovery of its ambiguous result.
+                self.db.notification_attempt(notification["id"])
+                await self.client.request(
+                    "PUT",
+                    f"/posts/{original['post_id']}/patch",
+                    json={"message": notification["message"]},
+                )
+                self.db.notification_sent(notification["id"], original["post_id"])
+                return
             self.db.notification_attempt(notification["id"])
             # Recover the crash window between remote POST success and local acknowledgement.
             if notification["attempts"] > 0:

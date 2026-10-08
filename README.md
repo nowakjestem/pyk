@@ -57,7 +57,9 @@ przy braku statystyk cgroup kontrola zachowuje ostrożniejszy, surowy pomiar.
 
 Przy pierwszym uruchomieniu bot ustala punkt początkowy i pomija stare wiadomości.
 Później synchronizuje przerwy przez REST API, również po restarcie. Edycje wiadomości
-nie są osobnym wyzwalaczem. Ponowne przesłanie linku w **nowej wiadomości** tworzy nowe
+nie są osobnym wyzwalaczem. Bot reaguje wyłącznie na **główne wiadomości kanału**;
+linki w odpowiedziach w wątkach są ignorowane także przy synchronizacji po przerwie.
+Ponowne przesłanie linku w **nowej głównej wiadomości** tworzy nowe
 zadanie; powtórzenie tego samego zdarzenia nie tworzy duplikatu.
 
 ### Konfiguracja Mattermosta
@@ -70,6 +72,22 @@ zadanie; powtórzenie tego samego zdarzenia nie tworzy duplikatu.
 
 Nie konfiguruj outgoing webhooka: Mattermost nie obsługuje go w kanałach prywatnych.
 Bot nasłuchuje `/api/v4/websocket`, a odpowiedzi wysyła przez `/api/v4/posts` z `root_id`.
+
+Jeden film otrzymuje **jedną początkową wiadomość bota**. Od razu zawiera ona ID zadania
+i miejsce w kolejce w chwili przyjęcia; liczymy trwające zadanie oraz oczekujące zadania
+usługowe, pomijając zakończone, nieudane i lokalne wyniki CLI. Po odczytaniu metadanych
+worker zleca uzupełnienie tego samego posta:
+
+> Przyjęto film do kolejki. Miejsce w kolejce przy przyjęciu: **2**. Zadanie `abcd1234`.
+>
+> Film: Film przykładowy.
+> Rozdziałów: 7. Rozpoczynam przetwarzanie.
+
+Aktualizacja oczekuje na dostarczenie potwierdzenia i używa
+[`PUT /posts/{post_id}/patch`](https://docs.mattermost.com/api/reference/posts).
+Bot musi mieć uprawnienie `edit_post`; polityka serwera powinna dopuszczać edycję również
+po dłuższym oczekiwaniu w kolejce. Błąd edycji nie tworzy zastępczego posta. Wyniki
+rozdziałów i zakończenie zadania nadal są publikowane w wątku źródłowym.
 
 ### Konfiguracja S3 i retencji
 
