@@ -2,8 +2,8 @@
 
 ## Środowisko i testy
 
-- Lokalnie Python 3.12.13, po zmianie komunikacji Mattermosta: 174 testy przeszły; 8 testów renderowania pominięto, ponieważ lokalny FFmpeg nie ma libass.
-- Na `narcyz`, nowy obraz Docker z Pythonem 3.12, FFmpeg/libass i whisper.cpp v1.8.7: **182 testy przeszły**. Współbieżność GPT miała wcześniej 175 zaliczonych testów. Oba zadania GitHub Actions dla wcześniejszej zmiany GPT (`699114e`, 163 testy) zakończyły się powodzeniem. Backend OpenAI Whisper miał wcześniej 152 zaliczone testy.
+- Lokalnie Python 3.12.13, po zmianie nazw plików: 181 testów przeszło; 8 testów renderowania pominięto, ponieważ lokalny FFmpeg nie ma libass.
+- Na `narcyz`, nowy obraz Docker z Pythonem 3.12, FFmpeg/libass i whisper.cpp v1.8.7: **189 testów przeszło**. Komunikacja Mattermosta miała wcześniej 182 zaliczone testy, współbieżność GPT — 175. Oba zadania GitHub Actions dla wcześniejszej zmiany GPT (`699114e`, 163 testy) zakończyły się powodzeniem. Backend OpenAI Whisper miał wcześniej 152 zaliczone testy.
 - Kontener testowy miał limit **768 MiB RAM, bez swapu, 2 vCPU**.
 - Lint Ruff, formatowanie i sprawdzenie lockfile zależności zakończyły się powodzeniem.
 - Render sprawdzono przez ffprobe, pełne dekodowanie FFmpeg oraz kontrolę pikseli: oba warianty są pionowe, zachowują audio i granice klipu, a wariant letterbox ma czarne pasy i napisy w dolnym pasie.
@@ -194,3 +194,18 @@ HTTP po POST potwierdza odzyskanie identyfikatora przed edycją. Ponowienie po n
 PUT edytuje ten sam post; nie tworzy drugiego i zachowuje fingerprint potwierdzenia oraz
 jego wątek. Nieudana edycja nie przełącza się na zastępczy POST. Klient serwera na VPS-ie
 zwrócił `PostEditTimeLimit: -1`; nie zmieniano ustawień Mattermosta.
+
+## Nazwy publikowanych plików
+
+Klucze wyników kończą się nazwą `YYYY-MM-DD-tytul-rozdzialu-crop.mp4` albo
+`YYYY-MM-DD-tytul-rozdzialu-letterboxed.mp4`. Slug używa małych liter ASCII, cyfr
+i myślników; polskie znaki, w tym ł, są poprawnie normalizowane. Oczyszczanie usuwa
+separatory ścieżek i ogranicza długość nazwy. Pusty slug przyjmuje nazwę `rozdzial`.
+Katalogi zadania i indeksu rozdziału zapobiegają kolizjom identycznych tytułów.
+
+Data pierwszego uploadu jest liczona w `Europe/Warsaw` i zapisywana razem z planowanymi
+kluczami przed kontaktem z S3. Test częściowego uploadu i wznowienia w kolejnym dniu
+potwierdza zachowanie tych samych nazw oraz wykorzystanie ukończonego renderu.
+Sprawdzono również polską datę przy zegarze UTC wskazującym jeszcze poprzedni dzień,
+emoji, długi tytuł i powtarzające się nazwy rozdziałów. Dostępność `Europe/Warsaw`
+potwierdzono w produkcyjnym kontenerze przed wdrożeniem.
