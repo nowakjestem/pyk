@@ -2,8 +2,8 @@
 
 ## Środowisko i testy
 
-- Lokalnie Python 3.12.13, po dodaniu GPT: 155 testów przeszło; 8 testów renderowania pominięto, ponieważ lokalny FFmpeg nie ma libass.
-- Na `narcyz`, nowy obraz Docker z Pythonem 3.12, FFmpeg/libass i whisper.cpp v1.8.7: **163 testy przeszły**. Oba zadania GitHub Actions dla zmiany GPT (`699114e`) zakończyły się powodzeniem. Wcześniejszy backend OpenAI Whisper miał 152 zaliczone testy.
+- Lokalnie Python 3.12.13, po dodaniu współbieżności GPT: 167 testów przeszło; 8 testów renderowania pominięto, ponieważ lokalny FFmpeg nie ma libass.
+- Na `narcyz`, nowy obraz Docker z Pythonem 3.12, FFmpeg/libass i whisper.cpp v1.8.7: **175 testów przeszło**. Oba zadania GitHub Actions dla wcześniejszej zmiany GPT (`699114e`, 163 testy) zakończyły się powodzeniem. Backend OpenAI Whisper miał wcześniej 152 zaliczone testy.
 - Kontener testowy miał limit **768 MiB RAM, bez swapu, 2 vCPU**.
 - Lint Ruff, formatowanie i sprawdzenie lockfile zależności zakończyły się powodzeniem.
 - Render sprawdzono przez ffprobe, pełne dekodowanie FFmpeg oraz kontrolę pikseli: oba warianty są pionowe, zachowują audio i granice klipu, a wariant letterbox ma czarne pasy i napisy w dolnym pasie.
@@ -149,3 +149,25 @@ Zadania przyjęte wcześniej zachowują model i styl z własnych snapshotów. Ko
 wstrzymano na czas próby renderowania, a następnie wznowiono. Test nie stanowi
 pełnej oceny jakości GPT ani dokładności synchronizacji całego filmu.
 Raport, transkrypcja i oba filmy: `data/gpt-verification/` na VPS-ie.
+
+## Równoległe zapytania GPT
+
+Dodano `asr.concurrency` (1–8); YAML i VPS używają trzech równoległych zapytań.
+Ograniczona pula wykonuje transkrypcję krótkich fragmentów wewnątrz rozdziału.
+Każde zapytanie ma osobny WAV i odpowiedź zapisywaną atomowo. Wyniki są składane
+w kolejności audio, niezależnie od kolejności odpowiedzi. Błąd albo anulowanie
+zatrzymuje pozostałe zapytania i czeka na ich sprzątnięcie; ukończony cache pozostaje.
+Renderowanie i zadania kolejki nadal są sekwencyjne. Starsze snapshoty bez nowego
+parametru zachowują współbieżność równą 1.
+
+Testy potwierdzają rzeczywisty overlap zapytań, limit aktywnych plików i brak pomieszania
+audio, odpowiedzi w odwróconej kolejności, wznowienie po częściowym błędzie oraz
+anulowanie bez osieroconych zadań. Adapter uwzględnia `Retry-After` w sekundach lub jako
+datę HTTP; niepoprawna wskazówka zachowuje dotychczasowe rosnące opóźnienie.
+
+Po wdrożeniu sprawdzono cztery rzeczywiste zapytania GPT na tej samej 30-sekundowej
+próbce. Zmierzono **trzy aktywne zapytania jednocześnie**, cztery odpowiedzi we właściwej
+kolejności oraz brak pozostałych tymczasowych plików WAV. Transkrypcja z wyodrębnieniem
+audio zajęła **2,27 s**, wobec wcześniejszych 4,58 s przy jednym zapytaniu naraz.
+To pojedynczy pomiar przy różnym obciążeniu API/VPS-a, nie gwarancja przyspieszenia
+całego filmu. Raport i transkrypcja: `data/gpt-parallel-verification/` na VPS-ie.
