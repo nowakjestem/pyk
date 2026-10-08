@@ -2,8 +2,8 @@
 
 ## Środowisko i testy
 
-- Lokalnie Python 3.12.13: 89 testów przeszło; 7 testów renderowania pominięto, ponieważ lokalny FFmpeg nie ma libass.
-- Na `narcyz`, obraz Docker z Pythonem 3.12, FFmpeg/libass i whisper.cpp v1.8.7: **96 testów przeszło**.
+- Lokalnie Python 3.12.13: 106 testów przeszło; 8 testów renderowania pominięto, ponieważ lokalny FFmpeg nie ma libass.
+- Na `narcyz`, obraz Docker z Pythonem 3.12, FFmpeg/libass i whisper.cpp v1.8.7: **114 testów przeszło**. Oba zadania CI dla poprawki granic rozdziałów również zakończyły się powodzeniem.
 - Kontener testowy miał limit **768 MiB RAM, bez swapu, 2 vCPU**.
 - Lint Ruff, formatowanie i sprawdzenie lockfile zależności zakończyły się powodzeniem.
 - Render sprawdzono przez ffprobe, pełne dekodowanie FFmpeg oraz kontrolę pikseli: oba warianty są pionowe, zachowują audio i granice klipu, a wariant letterbox ma czarne pasy i napisy w dolnym pasie.
@@ -28,21 +28,41 @@ RSS to pomiar pojedynczego procesu, nie całego kontenera. Cały benchmark ukoń
 w kontenerze z limitem 768 MiB. Nie wystąpiło OOM.
 
 Rozpoznanie próbki syntetycznej zawierało błędy. Ten pomiar potwierdza działanie i zasoby,
-nie jest oceną jakości na ludzkiej mowie. Jakość trzeba sprawdzić na docelowym polskim filmie;
-większy model można wskazać w YAML i ponownie zmierzyć jego pamięć przed zmianą domyślnego modelu.
+nie jest oceną jakości na ludzkiej mowie. Użytkownik ocenił również jakość napisów na docelowym
+polskim filmie jako niewystarczającą. Rozważane jest zewnętrzne API większego modelu;
+obecny kod nadal używa lokalnego modelu base Q5_0.
 
 Raport i filmy na VPS-ie: `/home/nowak/mattermost-rolki/data/benchmark-words/`.
 Lokalne podglądy: `artifacts/verification/word-background/` (poza Git).
 Pierwotny benchmark bez tła pozostał w `data/benchmark/` (4,54 s ASR, 191,61 MiB RSS).
 Model: `/home/nowak/mattermost-rolki/models/ggml-base-q5_0.bin`.
 
-## Gotowość integracji
+## Próba pełnej integracji
 
-Kod, konfiguracja, model i obrazy są przygotowane na VPS-ie w `/home/nowak/mattermost-rolki`.
-Bot i worker usługowy nie zostały uruchomione: brakuje adresu/tokena Mattermosta, ID kanału
-oraz konfiguracji i dostępu do S3. Lokalny szablon tych danych znajduje się w `.env.example`.
+Bot i worker działają na VPS-ie w `/home/nowak/mattermost-rolki` i mają zdrowe healthchecki.
+Link w prywatnym kanale Mattermosta uruchomił przetwarzanie rzeczywistego polskiego filmu:
+metadane wskazywały 14 min 14 s i 7 rozdziałów. Powstało **14 plików MP4**, po dwa warianty
+na rozdział. Wszystkie 14 publicznych URL zwróciło anonimowo `206 video/mp4` dla żądania
+zakresowego z nagłówkiem User-Agent przeglądarki; łączna wielkość wynosiła 285 690 272 bajtów.
+Odpowiedzi z linkami i potwierdzenie zakończenia zostały wysłane do właściwego wątku.
+Katalog roboczy zadania usunięto, a health endpoint potwierdził połączenie WebSocket
+i brak nieudanych powiadomień.
 
-Testy Mattermosta używają prawdziwego lokalnego serwera HTTP/WebSocket; testy S3 używają klienta
-testowego. Nie wykonano publikacji do rzeczywistego Mattermosta ani rzeczywistego S3.
-Polityki publicznego odczytu oraz retencja muszą zostać zastosowane w docelowym storage.
-Pełna próba około 20-minutowego filmu z rozdziałami wymaga jego URL i konfiguracji integracji.
+W S3 ustawiono lifecycle usuwający obiekty pod prefiksem `clips/` po 30 dniach oraz
+porzucający nieukończone multipart uploady po jednym dniu. Istniejąca polityka publicznego
+odczytu pozostała bez zmian.
+
+Próba ujawniła i pozwoliła naprawić dwa problemy:
+
+- Sprawdzenie pamięci kontenera traktowało odzyskiwalny cache pobranego filmu jako pamięć
+  zajętą przez procesy. Obecnie uwzględnia nieaktywny cache plików, zachowując dirty/writeback
+  i pamięć aktywną. Dodano testy dla cgroups v1/v2 oraz brakujących/uszkodzonych statystyk.
+- YouTube podawał zaokrąglone 854 s, podczas gdy pobrany plik miał 853,541 s. Koniec ostatniego
+  rozdziału jest teraz ograniczany do rzeczywistej długości źródła. Źródło krótsze od metadanych
+  o ponad sekundę nadal jest odrzucane. Dodano testy granic i rzeczywisty render krótkiego
+  ostatniego rozdziału dla obu wariantów.
+
+Wznowienie zachowało 12 już opublikowanych klipów i dokończyło dwa brakujące, bez ponownego
+wysyłania wcześniejszych wyników. W trakcie renderowania obserwowano około 370 MiB pamięci
+workera; nie wystąpiły zdarzenia OOM. Swap nie został dodany. Końcowy dostępny RAM hosta
+wynosił około 1 GiB. Próba dotyczyła filmu krótszego niż planowane około 20 minut tygodniowo.
