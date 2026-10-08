@@ -2,8 +2,8 @@
 
 ## Środowisko i testy
 
-- Lokalnie Python 3.12.13, po zmianie nazw plików: 181 testów przeszło; 8 testów renderowania pominięto, ponieważ lokalny FFmpeg nie ma libass.
-- Na `narcyz`, nowy obraz Docker z Pythonem 3.12, FFmpeg/libass i whisper.cpp v1.8.7: **189 testów przeszło**. Komunikacja Mattermosta miała wcześniej 182 zaliczone testy, współbieżność GPT — 175. Oba zadania GitHub Actions dla wcześniejszej zmiany GPT (`699114e`, 163 testy) zakończyły się powodzeniem. Backend OpenAI Whisper miał wcześniej 152 zaliczone testy.
+- Lokalnie Python 3.12.13, po dodaniu opisów: 203 testy przeszły; 8 testów renderowania pominięto, ponieważ lokalny FFmpeg nie ma libass.
+- Na `narcyz`, nowy obraz Docker z Pythonem 3.12, FFmpeg/libass i whisper.cpp v1.8.7: **211 testów przeszło**. Nazwy plików miały wcześniej 189 zaliczonych testów, komunikacja Mattermosta — 182, współbieżność GPT — 175. Oba zadania GitHub Actions dla wcześniejszej zmiany GPT (`699114e`, 163 testy) zakończyły się powodzeniem. Backend OpenAI Whisper miał wcześniej 152 zaliczone testy.
 - Kontener testowy miał limit **768 MiB RAM, bez swapu, 2 vCPU**.
 - Lint Ruff, formatowanie i sprawdzenie lockfile zależności zakończyły się powodzeniem.
 - Render sprawdzono przez ffprobe, pełne dekodowanie FFmpeg oraz kontrolę pikseli: oba warianty są pionowe, zachowują audio i granice klipu, a wariant letterbox ma czarne pasy i napisy w dolnym pasie.
@@ -209,3 +209,32 @@ potwierdza zachowanie tych samych nazw oraz wykorzystanie ukończonego renderu.
 Sprawdzono również polską datę przy zegarze UTC wskazującym jeszcze poprzedni dzień,
 emoji, długi tytuł i powtarzające się nazwy rozdziałów. Dostępność `Europe/Warsaw`
 potwierdzono w produkcyjnym kontenerze przed wdrożeniem.
+
+## Opisy rozdziałów do Instagram/TikTok
+
+Testy sprawdzają żądanie Responses API z dokładnym modelem `gpt-6.1-sol`, reasoningiem
+`low`, `store: false` oraz transkrypcją jednego rozdziału. Odmowa, pusty opis,
+nieukończona odpowiedź, nieprawidłowy JSON i przekroczenie limitu znaków nie są publikowane
+jako gotowy opis. Błędy autoryzacji, niedostępny model i brak salda nie zmieniają modelu
+ani nie ujawniają treści odpowiedzi API. Błędy przejściowe respektują `Retry-After`.
+
+Próba pipeline z dwoma rozdziałami potwierdza zapis opisu przed publikacją, wykorzystanie
+cache po wznowieniu i brak ponownej transkrypcji lub uploadu ukończonych klipów po błędzie
+generowania kolejnego opisu. Cisza nie wywołuje płatnego żądania i nie tworzy wymyślonego
+opisu. Starsze snapshoty konfiguracji zachowują wyłączoną funkcję.
+
+Outbox po migracji do schematu 4 ma opcjonalną zależność `after_event`. Test utraty
+odpowiedzi po POST linków potwierdza brak przedwczesnej publikacji opisu, odzyskanie
+posta bez duplikatu i kolejność linki → opis → kolejne linki → kolejny opis → zakończenie.
+Po trwałym błędzie linków opis czeka na ręczne ponowienie powiadomień.
+
+Na VPS-ie wykonano rzeczywiste wywołanie API z zapisaną transkrypcją ukończonego rozdziału:
+2766 znaków transkrypcji, 512 znaków gotowego opisu, czas 5,32 s. Model: `gpt-6.1-sol`,
+reasoning: `low`. Sprawdzono tekst opisu; zawiera konkretne streszczenie oraz pięć
+tematycznych hashtagów, bez etykiet. Prywatny wynik i raport zapisano w ignorowanym
+`data/descriptions-verification/` na serwerze. Ta próba nie wysłała wiadomości do Mattermosta.
+
+Zachowano niestandardowe ustawienia VPS-a i wykonano backup konfiguracji oraz SQLite.
+Nowy obraz przeszedł `check --integrations --tools`; bot i worker zostały odtworzone.
+Po restarcie `/healthz` potwierdził aktywne WebSocket, brak błędów powiadomień i zdrową
+aplikację. Aktywna konfiguracja ma włączone opisy i wskazany model; baza ma schemat 4.
