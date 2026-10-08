@@ -1,0 +1,17 @@
+.env
+.env.*
+!.env.example
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+data/
+models/
+fonts/
+artifacts/
+compose.override.yaml
+dist/
+build/
+.DS_Store

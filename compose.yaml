@@ -1,0 +1,54 @@
+name: mattermost-rolki
+
+x-common: &common
+  image: mattermost-rolki:local
+  build:
+    context: .
+    target: runtime
+  user: "${APP_UID:-10001}:${APP_GID:-10001}"
+  init: true
+  restart: unless-stopped
+  env_file: .env
+  volumes:
+    - ./config.yaml:/app/config.yaml:ro
+    - ./data:/app/data
+    - ./models:/app/models:ro
+  read_only: true
+  tmpfs:
+    - /tmp:size=32m,mode=1777
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+  logging:
+    driver: json-file
+    options:
+      max-size: 10m
+      max-file: '3'
+
+services:
+  bot:
+    <<: *common
+    command: [bot]
+    mem_limit: 128m
+    memswap_limit: 128m
+    cpus: 0.25
+    ports:
+      - 127.0.0.1:8089:8089
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8089/healthz', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      start_period: 30s
+      retries: 3
+  worker:
+    <<: *common
+    command: [worker]
+    mem_limit: 768m
+    memswap_limit: 768m
+    cpus: 2
+    stop_grace_period: 40s
+    healthcheck:
+      test: [CMD, rolki, health, --worker]
+      interval: 30s
+      timeout: 10s
+      start_period: 30s
+      retries: 3

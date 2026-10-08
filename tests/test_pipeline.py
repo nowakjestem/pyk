@@ -1,0 +1,145 @@
+import json
+
+import pytest
+
+from rolki.errors import PermanentError, ResourceWait
+from rolki.pipeline import Pipeline
+from rolki.subtitles import Cue, Word
+from rolki.worker import execute
+
+
+@pytest.fixture
+def fake_media(monkeypatch):
+    from rolki import pipeline
+
+    calls = {"metadata": 0, "download": 0, "transcribe": 0, "render": [], "upload": []}
+
+    async def process(args, **_kwargs):
+        operation = args[3]
+        from pathlib import Path
+
+        root = Path(args[5])
+        calls[operation] += 1
+        if operation == "metadata":
+            result = {
+                "title": "Film testowy",
+                "duration": 20,
+                "chapters": [
+                    {"start_time": 0, "title": "Pierwszy"},
+                    {"start_time": 10, "title": "Drugi"},
+                ],
+            }
+        else:
+            (root / "source.mkv").write_bytes(b"source")
+            result = {"source": "source.mkv"}
+        (root / f"{operation}.json").write_text(json.dumps(result))
+
+    async def probe(_source):
+        return {"streams": [{"codec_type": "audio"}]}
+
+    async def transcribe(_source, _chapter, _root, _config):
+        calls["transcribe"] += 1
+        return [
+            Cue(
+                0,
+                2,
+                "Zażółć gęślą jaźń",
+                (
+                    Word(0.1, 0.5, "Zażółć"),
+                    Word(0.6, 1.1, "gęślą"),
+                    Word(1.2, 1.8, "jaźń"),
+                ),
+            )
+        ]
+
+    async def render(_source, chapter, root, _config, variant):
+        calls["render"].append((chapter["index"], variant))
+        output = root / f"{variant}.mp4"
+        output.write_bytes(b"rendered")
+        return output
+
+    class Storage:
+        fail_key = None
+
+        def __init__(self, _config):
+            pass
+
+        async def upload(self, _path, key):
+            calls["upload"].append(key)
+            if self.fail_key and self.fail_key in key:
+                raise PermanentError("S3 odrzuciło operację.")
+            return "https://clips.example/" + key
+
+    monkeypatch.setattr(pipeline, "run_process", process)
+    monkeypatch.setattr(pipeline, "probe", probe)
+    monkeypatch.setattr(pipeline, "transcribe", transcribe)
+    monkeypatch.setattr(pipeline, "render", render)
+    monkeypatch.setattr(pipeline, "S3Storage", Storage)
+    return calls, Storage
+
+
+async def test_pipeline_two_variants_per_chapter(db, config, enqueue, fake_media):
+    calls, _ = fake_media
+    job_id = enqueue()
+    await execute(db, Pipeline(db), db.claim())
+    assert db.get(job_id)["status"] == "done"
+    assert len(calls["render"]) == 4
+    assert calls["transcribe"] == 2
+    assert calls["download"] == 1
+    state = json.loads(db.get(job_id)["checkpoint"])
+    assert all(set(r["variants"]) == {"crop", "letterbox"} for r in state["results"].values())
+    assert not (config.paths.work_dir / job_id).exists()
+    messages = db.pending_notifications()
+    assert len(messages) == 5
+    assert all(message["root_id"] == "root" for message in messages)
+
+
+async def test_resume_partial_upload_no_retranscription(db, enqueue, fake_media):
+    calls, storage = fake_media
+    storage.fail_key = "/000/letterbox.mp4"
+    job_id = enqueue()
+    await execute(db, Pipeline(db), db.claim())
+    assert db.get(job_id)["status"] == "failed"
+    assert "crop" in json.loads(db.get(job_id)["checkpoint"])["results"]["0"]["variants"]
+    saved = json.loads(db.get(job_id)["checkpoint"])["results"]["0"]["cues"][0]
+    assert saved["words"][0] == {"start": 0.1, "end": 0.5, "text": "Zażółć"}
+    storage.fail_key = None
+    db.retry(job_id)
+    await execute(db, Pipeline(db), db.claim())
+    assert db.get(job_id)["status"] == "done"
+    assert calls["transcribe"] == 2
+    assert calls["render"].count((0, "crop")) == 1
+    assert (
+        calls["render"].count((0, "letterbox")) == 1
+    )  # Reuse completed render after failed upload.
+
+
+async def test_resource_wait_does_not_fail_or_spam(db, enqueue, monkeypatch):
+    from rolki import pipeline
+
+    def unavailable(*_args, **_kwargs):
+        raise ResourceWait("Za mało RAM.")
+
+    monkeypatch.setattr(pipeline, "check_resources", unavailable)
+    monkeypatch.setattr(pipeline, "S3Storage", lambda _config: None)
+    job_id = enqueue()
+    for _ in range(2):
+        if db.get(job_id)["status"] == "waiting":
+            db.retry(job_id)
+        await execute(db, Pipeline(db), db.claim())
+    assert db.get(job_id)["status"] == "waiting"
+    assert len(db.pending_notifications()) == 2
+
+
+async def test_no_chapters_stops_before_download(db, enqueue, fake_media, monkeypatch):
+    from rolki import pipeline
+
+    def missing(_metadata, _max):
+        raise PermanentError("Film nie ma rozdziałów.")
+
+    monkeypatch.setattr(pipeline, "validate_chapters", missing)
+    calls, _ = fake_media
+    job_id = enqueue()
+    await execute(db, Pipeline(db), db.claim())
+    assert db.get(job_id)["status"] == "failed"
+    assert calls["download"] == 0

@@ -1,0 +1,17 @@
+name: tests
+on: [push, pull_request]
+jobs:
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync --locked --extra dev --python 3.12
+      - run: uv run ruff check .
+      - run: uv run pytest -q
+  media:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build --target test -t rolki-tests .
+      - run: docker run --rm --memory=768m --memory-swap=768m --cpus=2 rolki-tests -m pytest -q
