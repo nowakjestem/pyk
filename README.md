@@ -113,7 +113,15 @@ skonfigurować usuwanie nieaktualnych wersji i delete markerów. Lifecycle dzia�
 nie jest gwarancją usunięcia co do sekundy. Usługi zgodne z S3 muszą obsługiwać lifecycle
 albo mieć równoważną regułę retencji u dostawcy.
 
-Upload jest jednoznaczny dzięki kluczowi `clips/{job_id}/{chapter_index}/{variant}.mp4`.
+Plik ma nazwę `YYYY-MM-DD-tytul-rozdzialu-crop.mp4` lub
+`YYYY-MM-DD-tytul-rozdzialu-letterboxed.mp4`, np.
+`2026-10-09-pierwszy-rozdzial-letterboxed.mp4`. Tytuł jest zamieniany na slug z małych
+liter ASCII i cyfr, oddzielanych myślnikami; polskie znaki tracą diakrytykę. Slug ma limit
+160 znaków, a pusty tytuł po oczyszczeniu używa `rozdzial`.
+Data pochodzi z pierwszej publikacji zadania, w strefie `Europe/Warsaw`, i jest zapisywana
+w checkpoint razem z planowanymi kluczami przed uploadem. Wznowienie po północy
+zachowuje te same nazwy. Klucz to `clips/{job_id}/{chapter_index}/{filename}`:
+osobne katalogi zapobiegają kolizjom nawet przy identycznych tytułach rozdziałów.
 Aplikacja sprawdza rozmiar i metadane SHA-256 przez HEAD przed potwierdzeniem wyniku.
 Duże pliki używają multipart bez równoległych wątków.
 

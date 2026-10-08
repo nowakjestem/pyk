@@ -11,6 +11,7 @@ from pathlib import Path
 from .config import Config
 from .db import Database, acceptance_message
 from .errors import PermanentError, ResourceWait, TransientError
+from .filenames import clip_filename, current_output_date
 from .media import chapters_for_source, probe, render, transcribe, validate_chapters
 from .process import retry_network, run_process
 from .resources import check_resources
@@ -126,8 +127,16 @@ class Pipeline:
                     output = chapter_root / f"{variant}.mp4"
                     if not output.is_file():
                         output = await render(source, chapter, chapter_root, config, variant)
-                    save(f"uploading:{index}:{variant}")
-                    key = f"{config.s3.prefix}/{job['id']}/{chapter['index']:03}/{variant}.mp4"
+                    if "output_date" not in state:
+                        state["output_date"] = current_output_date()
+                    keys = result.setdefault("upload_keys", {})
+                    if variant not in keys:
+                        filename = clip_filename(chapter["title"], variant, state["output_date"])
+                        keys[variant] = (
+                            f"{config.s3.prefix}/{job['id']}/{chapter['index']:03}/{filename}"
+                        )
+                    key = keys[variant]
+                    save(f"uploading:{index}:{variant}")  # Persist names before external I/O.
                     url = await retry_network(
                         lambda output=output, key=key: storage.upload(output, key)
                     )

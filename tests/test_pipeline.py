@@ -78,7 +78,8 @@ def fake_media(monkeypatch):
     return calls, Storage
 
 
-async def test_pipeline_two_variants_per_chapter(db, config, enqueue, fake_media):
+async def test_pipeline_two_variants_per_chapter(db, config, enqueue, fake_media, monkeypatch):
+    monkeypatch.setattr("rolki.pipeline.current_output_date", lambda: "2026-10-09")
     calls, _ = fake_media
     job_id = enqueue()
     await execute(db, Pipeline(db), db.claim())
@@ -86,6 +87,12 @@ async def test_pipeline_two_variants_per_chapter(db, config, enqueue, fake_media
     assert len(calls["render"]) == 4
     assert calls["transcribe"] == 2
     assert calls["download"] == 1
+    assert {key.rsplit("/", 1)[1] for key in calls["upload"]} == {
+        "2026-10-09-pierwszy-crop.mp4",
+        "2026-10-09-pierwszy-letterboxed.mp4",
+        "2026-10-09-drugi-crop.mp4",
+        "2026-10-09-drugi-letterboxed.mp4",
+    }
     state = json.loads(db.get(job_id)["checkpoint"])
     assert all(set(r["variants"]) == {"crop", "letterbox"} for r in state["results"].values())
     assert not (config.paths.work_dir / job_id).exists()
@@ -99,24 +106,51 @@ async def test_pipeline_two_variants_per_chapter(db, config, enqueue, fake_media
     assert "Rozdziałów: 2. Rozpoczynam przetwarzanie." in started["message"]
 
 
-async def test_resume_partial_upload_no_retranscription(db, enqueue, fake_media):
+async def test_resume_partial_upload_no_retranscription(db, enqueue, fake_media, monkeypatch):
+    monkeypatch.setattr("rolki.pipeline.current_output_date", lambda: "2026-10-09")
     calls, storage = fake_media
-    storage.fail_key = "/000/letterbox.mp4"
+    storage.fail_key = "pierwszy-letterboxed.mp4"
     job_id = enqueue()
     await execute(db, Pipeline(db), db.claim())
     assert db.get(job_id)["status"] == "failed"
+    state = json.loads(db.get(job_id)["checkpoint"])
+    assert state["output_date"] == "2026-10-09"
+    assert state["results"]["0"]["upload_keys"]["letterbox"].endswith(
+        "2026-10-09-pierwszy-letterboxed.mp4"
+    )
     assert "crop" in json.loads(db.get(job_id)["checkpoint"])["results"]["0"]["variants"]
     saved = json.loads(db.get(job_id)["checkpoint"])["results"]["0"]["cues"][0]
     assert saved["words"][0] == {"start": 0.1, "end": 0.5, "text": "Zażółć"}
     storage.fail_key = None
+    monkeypatch.setattr("rolki.pipeline.current_output_date", lambda: "2026-10-10")
     db.retry(job_id)
     await execute(db, Pipeline(db), db.claim())
     assert db.get(job_id)["status"] == "done"
     assert calls["transcribe"] == 2
+    assert all("2026-10-09-" in key for key in calls["upload"])
+    assert len(set(calls["upload"])) == 4
     assert calls["render"].count((0, "crop")) == 1
     assert (
         calls["render"].count((0, "letterbox")) == 1
     )  # Reuse completed render after failed upload.
+
+
+async def test_duplicate_chapter_titles_have_distinct_paths(db, enqueue, fake_media, monkeypatch):
+    from rolki import pipeline
+
+    validate = pipeline.validate_chapters
+    monkeypatch.setattr(
+        pipeline,
+        "validate_chapters",
+        lambda info, limit: [
+            {**chapter, "title": "Ten sam tytuł"} for chapter in validate(info, limit)
+        ],
+    )
+    calls, _ = fake_media
+    enqueue()
+    await execute(db, Pipeline(db), db.claim())
+    assert len(set(calls["upload"])) == 4
+    assert len({key.rsplit("/", 1)[1] for key in calls["upload"]}) == 2
 
 
 async def test_resource_wait_does_not_fail_or_spam(db, enqueue, monkeypatch):
