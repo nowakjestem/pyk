@@ -146,6 +146,11 @@ async def test_multipart_fields_and_retries_reopen_same_audio(tmp_path, monkeypa
         (404, "model_not_found", PermanentError, 1),
         (302, "redirect", PermanentError, 1),
         (429, "insufficient_quota", PermanentError, 1),
+        (429, "credit_balance_exhausted", PermanentError, 1),
+        (429, "organization_spend_limit_exceeded", PermanentError, 1),
+        (429, "project_spend_limit_exceeded", PermanentError, 1),
+        (429, "organization_usage_limit_exceeded", PermanentError, 1),
+        (429, "billing_hard_limit_reached", PermanentError, 1),
         (429, "rate_limit_exceeded", TransientError, 3),
         (500, "server_error", TransientError, 3),
     ],
@@ -175,6 +180,30 @@ async def test_errors_retry_only_transient_without_leaking_api_body(
             await transcribe_audio(audio, ASR(provider="openai"))
     assert calls == attempts
     assert "test-secret" not in str(exc.value) and "private content" not in str(exc.value)
+
+
+async def test_streamed_quota_error_is_read_fully_before_classification(tmp_path, monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    audio = tmp_path / "audio.wav"
+    audio.write_bytes(b"audio")
+    calls = 0
+
+    async def handler(request):
+        nonlocal calls
+        calls += 1
+        await request.read()
+        response = web.StreamResponse(status=429, headers={"Content-Type": "application/json"})
+        await response.prepare(request)
+        await response.write(b'{"error": {"code": "new_quota_code",')
+        await asyncio.sleep(0.01)
+        await response.write(b'"type": "insufficient_quota", "message": "private"}}')
+        await response.write_eof()
+        return response
+
+    async with server(handler, monkeypatch):
+        with pytest.raises(PermanentError, match="Brak środków"):
+            await transcribe_audio(audio, ASR(provider="openai"))
+    assert calls == 1
 
 
 async def test_auto_language_and_malformed_json(tmp_path, monkeypatch):
