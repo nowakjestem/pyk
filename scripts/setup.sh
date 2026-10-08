@@ -11,4 +11,4 @@ config_uid_lines=$(sed -n '/^APP_UID=/p' .env)
 if [ -z "$config_uid_lines" ]; then
   printf '\nAPP_UID=%s\nAPP_GID=%s\n' "$(id -u)" "$(id -g)" >> .env
 fi
-printf '%s\n' 'Uzupełnij .env, następnie: docker compose build && docker compose run --rm -v ./models:/app/models bot model-download'
+printf '%s\n' 'Uzupełnij .env (w tym OPENAI_API_KEY), następnie: docker compose build && docker compose run --rm --no-deps bot check --integrations --tools'

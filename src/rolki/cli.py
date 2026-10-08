@@ -116,8 +116,12 @@ async def async_main(args, config):
     if args.command == "check":
         if args.integrations:
             config.require_integrations()
+            config.require_asr()
         if args.tools:
-            for binary in ("ffmpeg", "ffprobe", "deno", config.asr.binary, config.asr.quantizer):
+            binaries = ["ffmpeg", "ffprobe", "deno"]
+            if config.asr.provider == "local":
+                binaries.extend((config.asr.binary, config.asr.quantizer))
+            for binary in binaries:
                 if not shutil.which(binary):
                     raise JobError(f"Brak programu: {binary}.")
             filters = await run_process(["ffmpeg", "-hide_banner", "-filters"], timeout=30)
@@ -133,7 +137,7 @@ async def async_main(args, config):
             }
             if config.subtitles.font.casefold() not in installed:
                 raise JobError(f"Font {config.subtitles.font!r} nie jest zainstalowany.")
-            if not config.asr.model_path.is_file():
+            if config.asr.provider == "local" and not config.asr.model_path.is_file():
                 raise JobError("Brak modelu ASR. Uruchom rolki model-download.")
         print(f"Konfiguracja poprawna. Wersja: {config.revision}")
         return 0
@@ -169,6 +173,7 @@ async def async_main(args, config):
         print(json.dumps(state, indent=2))
         return 0 if state["failed_notifications"] == 0 else 1
     elif args.command == "run":
+        config.require_asr()
         links = youtube_links(args.url)
         if len(links) != 1:
             raise ValueError("Podaj pojedynczy link do filmu YouTube.")

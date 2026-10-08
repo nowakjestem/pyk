@@ -9,6 +9,7 @@ from pathlib import Path
 
 from .config import Config, Video
 from .errors import PermanentError
+from .openai_asr import parse_openai, transcribe_audio
 from .process import run_process
 from .resources import check_resources
 from .subtitles import Cue, parse_whisper
@@ -126,8 +127,13 @@ def silent_audio(path: Path) -> bool:
 
 
 async def transcribe(source: Path, chapter: dict, root: Path, config: Config) -> list[Cue]:
-    if not config.asr.model_path.is_file():
+    if config.asr.provider == "local" and not config.asr.model_path.is_file():
         raise PermanentError("Brak modelu ASR. Uruchom komendę rolki model-download.")
+    if config.asr.provider == "openai":
+        try:
+            config.require_asr()
+        except ValueError as exc:
+            raise PermanentError(str(exc)) from exc
     cues = []
     duration = chapter["end"] - chapter["start"]
     for offset in range(0, math.ceil(duration), config.asr.max_chunk_seconds):
@@ -137,6 +143,22 @@ async def transcribe(source: Path, chapter: dict, root: Path, config: Config) ->
         await extract_audio(source, audio, chapter["start"] + offset, chunk_duration)
         try:
             if silent_audio(audio):
+                continue
+            if config.asr.provider == "openai":
+                cached = root / f"openai-{offset:05}.json"
+                if cached.is_file():
+                    try:
+                        document = json.loads(cached.read_text(encoding="utf-8"))
+                    except ValueError as exc:
+                        raise PermanentError("Niepoprawny zapis transkrypcji OpenAI na dysku.") from exc
+                else:
+                    document = await transcribe_audio(audio, config.asr)
+                chunk_cues = parse_openai(document, offset=offset, duration=chunk_duration)
+                if not cached.is_file():
+                    temporary = cached.with_suffix(".part.json")
+                    temporary.write_text(json.dumps(document, ensure_ascii=False), encoding="utf-8")
+                    temporary.replace(cached)
+                cues.extend(chunk_cues)
                 continue
             prefix = root / "whisper"
             await run_process(

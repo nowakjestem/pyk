@@ -4,7 +4,8 @@ Bot w prywatnym kanale Mattermosta przyjmuje zwykłe wiadomości z linkiem do Yo
 Z każdego rozdziału tworzy dwa MP4 z polskimi napisami: wycięty pionowy kadr oraz pełny
 obraz na pionowym czarnym tle. Publikuje linki S3 w wątku wiadomości źródłowej.
 
-Python 3.12, SQLite, yt-dlp + Deno/EJS, whisper.cpp na CPU, FFmpeg/libass i Docker Compose.
+Python 3.12, SQLite, yt-dlp + Deno/EJS, bezpośrednie API OpenAI, FFmpeg/libass i Docker Compose.
+Lokalny whisper.cpp pozostaje opcjonalnym backendem i obsługuje starsze zadania.
 Bez Redis, Celery, publicznego webhooka i panelu administracyjnego.
 
 ## Uruchomienie na VPS
@@ -19,7 +20,6 @@ cd /home/nowak/mattermost-rolki
 sh scripts/setup.sh
 # Uzupełnij .env na serwerze.
 docker compose build
-docker compose run --rm -v ./models:/app/models bot model-download
 docker compose run --rm bot check --integrations --tools
 docker compose up -d
 curl --fail http://127.0.0.1:8089/healthz
@@ -47,7 +47,8 @@ GitHub Actions uruchamia lint i testy na push oraz pull request; wdrożenie na V
 
 Bot ma limit 128 MiB; worker 768 MiB oraz 2 vCPU. Swap nie jest wymagany ani automatycznie
 tworzony. Jednocześnie działa jeden proces kosztownego etapu. Obie wersje klipu powstają
-kolejno. Model jest ładowany przez osobny proces i zwalniany przed renderowaniem.
+kolejno. W trybie OpenAI model działa u dostawcy; VPS wyodrębnia audio i renderuje napisy.
+W opcjonalnym trybie lokalnym model jest zwalniany przed renderowaniem.
 
 Kontrola zapasu pamięci kontenera uwzględnia czysty, nieaktywny cache plików,
 który Linux może odzyskać. Pobrany film w cache nie blokuje kolejnego etapu.
@@ -97,6 +98,35 @@ albo mieć równoważną regułę retencji u dostawcy.
 Upload jest jednoznaczny dzięki kluczowi `clips/{job_id}/{chapter_index}/{variant}.mp4`.
 Aplikacja sprawdza rozmiar i metadane SHA-256 przez HEAD przed potwierdzeniem wyniku.
 Duże pliki używają multipart bez równoległych wątków.
+
+### Konfiguracja OpenAI
+
+Do `.env` dodaj `OPENAI_API_KEY` z uprawnieniem do tworzenia transkrypcji audio.
+Klucz jest odczytywany z otoczenia procesu; nie trafia do YAML, checkpointów ani Git.
+Po dodaniu lub zmianie klucza **odtwórz kontenery** — sam restart nie przeładowuje `env_file`:
+
+```sh
+docker compose run --rm --no-deps bot check --integrations --tools
+docker compose up -d --force-recreate bot worker
+```
+
+Domyślnie wysyłamy do `https://api.openai.com/v1/audio/transcriptions` wyłącznie audio
+mono 16 kHz w fragmentach do 300 sekund, raz dla obu wariantów klipu. Nie ma pośrednika.
+Model `whisper-1` zwraca `verbose_json` z czasami słów i segmentów. `gpt-transcribe` nie
+udostępnia czasów słów wymaganych przez ten pipeline; nie można podmienić go samą nazwą
+w YAML. Własne nazwy i pisownię można podać w `asr.prompt`.
+
+OpenAI zapowiada wyłączenie `whisper-1` na **26 lutego 2027**. Przed tą datą backend będzie
+wymagał migracji z zachowaniem synchronizacji napisów. Źródła:
+[OpenAI Docs — transkrypcja i czasy słów](https://developers.openai.com/api/docs/guides/speech-to-text),
+[harmonogram wyłączeń](https://developers.openai.com/api/docs/deprecations).
+
+Brak klucza jest wykrywany przed uruchomieniem workera i przy kontroli integracji.
+Błędy autoryzacji i brak środków kończą zadanie czytelnym komunikatem. Błędy połączenia,
+limit chwilowy i błędy serwera mają maksymalnie trzy próby. Surowe odpowiedzi błędów API
+nie są publikowane. Rozpoznane fragmenty są zapisywane atomowo w katalogu rozdziału;
+wznowienie wykorzystuje je zamiast powtarzać płatne zapytania. Utrata połączenia po
+przyjęciu żądania przez OpenAI może mimo to prowadzić do ponownego naliczenia opłaty.
 
 ## YAML: obraz, napisy i ASR
 
@@ -171,7 +201,9 @@ ma zakres 0–1 (1 oznacza nieprzezroczyste), a `padding` to odstęp w pikselach
 Obrys i kolor liter są niezależne od tła. Domyślny YAML wybiera Lato i niebieskie tło słowa;
 na czarne tło całej linijki zmień `mode: line` i `color: '#000000'`.
 
-Whisper jest uruchamiany z `-ojf`: pełny JSON zawiera czasy tokenów. Aplikacja łączy
+OpenAI zwraca pełne słowa z czasami; aplikacja zachowuje interpunkcję segmentów i dobiera
+krótkie frazy według granic słów. W opcjonalnym trybie lokalnym Whisper jest uruchamiany
+z `-ojf`: pełny JSON zawiera czasy tokenów. Aplikacja łączy
 tokeny w słowa z interpunkcją i dobiera frazy według granic tych słów. Są to
 [eksperymentalne czasy whisper.cpp](https://github.com/ggml-org/whisper.cpp/tree/v1.8.7#word-level-timestamp-experimental),
 bez dodatkowego modelu forced alignment; mogą być niedokładne. Jeśli dane słów są
@@ -185,12 +217,27 @@ SRT pozostaje zwykłym tekstem; dynamiczne tło znajduje się w ASS i wypalonym 
 Domyślnie źródło jest ograniczone do 1080p; crop z takiego materiału bywa powiększany.
 Zwiększenie rozdzielczości oznacza większy koszt i zużycie pamięci — wymaga ponownego benchmarku.
 
-ASR domyślnie używa **wielojęzycznego** `base` w kwantyzacji Q5_0, języka `pl` i dwóch wątków.
+ASR domyślnie używa OpenAI `whisper-1` i języka `pl`:
+
+```yaml
+asr:
+  provider: openai
+  model: whisper-1
+  language: pl
+  prompt: ''
+  max_chunk_seconds: 300
+  request_timeout_seconds: 300
+```
+
 Audio jest dzielone na maksymalnie pięciominutowe fragmenty z zachowaniem przesunięć czasu.
 Całkowicie ciche fragmenty są pomijane; jakość przy muzyce, szumie i nazwach własnych wymaga
 sprawdzenia na własnych nagraniach. Dla angielskiego ustaw `language: en`, dla autodetekcji `auto`.
-Model można zmienić przez `model_url` i `model_path`; nie używaj modeli `.en` dla polskiego.
-Duże modele i nowsze modele wymagające większego RAM nie są domyślnie ładowane na tym VPS-ie.
+
+Dla lokalnego trybu ustaw `asr.provider: local`. Wtedy domyślnie używany jest wielojęzyczny
+`base` Q5_0 i dwa wątki. Pobierz model przez
+`docker compose run --rm -v ./models:/app/models bot model-download`.
+Lokalny model można zmienić przez `model_url` i `model_path`; nie używaj modeli `.en` dla polskiego.
+Zadania zapisane przed dodaniem API zachowują tryb lokalny i nie wymagają klucza OpenAI.
 
 ## CLI, kolejka i odzyskiwanie
 
@@ -268,6 +315,9 @@ RSS pojedynczego procesu potomnego, nie sumę pamięci całego kontenera; limit 
 cały kontener. Dla oceny jakości na ludzkiej mowie zamontuj własny plik i użyj `--source`.
 Próbka syntetyczna sprawdza działanie oraz zasoby, nie dowodzi jakości na docelowych filmach.
 Nie gwarantujemy czasu wykonania przed pomiarem prawdziwego materiału około 20 minut.
+Benchmark domyślnie używa `--provider local`, niezależnie od backendu w YAML.
+Próbę OpenAI uruchom przez `--provider openai`, przekazując klucz w `env_file` i używając
+osobnego, pustego katalogu `--output`. Taka próba wykonuje płatne zapytania API.
 
 ## Granice v1
 

@@ -11,16 +11,12 @@ paths:
   output_dir: data/output
 
 asr:
-  binary: whisper-cli
-  quantizer: whisper-quantize
-  model_path: models/ggml-base-q5_0.bin
-  # Download the full-precision multilingual model and quantize locally.
-  model_url: https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin
-  quantization: q5_0
+  provider: openai # local zachowuje obsługę whisper.cpp i starszych zadań
+  model: whisper-1 # tekst + rzeczywiste czasy słów i segmentów w jednym zapytaniu
+  prompt: '' # opcjonalny słownik nazw własnych, w języku nagrania
+  request_timeout_seconds: 300
   language: pl
-  threads: 2
   max_chunk_seconds: 300
-  timeout_seconds: 7200
 
 video:
   width: 720

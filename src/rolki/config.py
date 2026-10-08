@@ -44,6 +44,11 @@ class Paths(Settings):
 
 
 class ASR(Settings):
+    # Keep local as the schema default for jobs saved before API support.
+    provider: Literal["local", "openai"] = "local"
+    model: Literal["whisper-1"] = "whisper-1"
+    prompt: str = Field(default="", max_length=1024)
+    request_timeout_seconds: int = Field(default=300, ge=10, le=3600)
     binary: str = "whisper-cli"
     quantizer: str = "whisper-quantize"
     model_path: Path = Path("models/ggml-base-q5_0.bin")
@@ -212,6 +217,10 @@ class Config(Settings):
     def require_storage(self):
         if not self.s3.bucket or not self.s3.public_base_url:
             raise ValueError("Uzupełnij S3_BUCKET i S3_PUBLIC_BASE_URL.")
+
+    def require_asr(self):
+        if self.asr.provider == "openai" and not os.getenv("OPENAI_API_KEY", "").strip():
+            raise ValueError("Brak OPENAI_API_KEY w .env.")
 
 
 def validate_url(value: str) -> str:
