@@ -49,6 +49,11 @@ Bot ma limit 128 MiB; worker 768 MiB oraz 2 vCPU. Swap nie jest wymagany ani aut
 tworzony. Jednocześnie działa jeden proces kosztownego etapu. Obie wersje klipu powstają
 kolejno. Model jest ładowany przez osobny proces i zwalniany przed renderowaniem.
 
+Kontrola zapasu pamięci kontenera uwzględnia czysty, nieaktywny cache plików,
+który Linux może odzyskać. Pobrany film w cache nie blokuje kolejnego etapu.
+Pamięć procesów, tmpfs i strony oczekujące na zapis pozostają w zużyciu;
+przy braku statystyk cgroup kontrola zachowuje ostrożniejszy, surowy pomiar.
+
 Przy pierwszym uruchomieniu bot ustala punkt początkowy i pomija stare wiadomości.
 Później synchronizuje przerwy przez REST API, również po restarcie. Edycje wiadomości
 nie są osobnym wyzwalaczem. Ponowne przesłanie linku w **nowej wiadomości** tworzy nowe

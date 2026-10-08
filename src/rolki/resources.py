@@ -17,17 +17,31 @@ def available_memory() -> int | None:
     return None
 
 
+def working_set(used: int, root: Path, *, v1=False) -> int:
+    """Exclude clean inactive file cache; retain anonymous and dirty memory."""
+    try:
+        stats = dict(line.split() for line in (root / "memory.stat").read_text().splitlines())
+        inactive = int(stats.get("total_inactive_file" if v1 else "inactive_file", "0"))
+        dirty = int(stats.get("total_dirty" if v1 else "file_dirty", "0"))
+        writeback = int(stats.get("total_writeback" if v1 else "file_writeback", "0"))
+        reclaimable = max(0, inactive - max(0, dirty) - max(0, writeback))
+        return max(0, used - reclaimable)
+    except (OSError, ValueError):
+        return used  # Missing/malformed statistics must not overestimate headroom.
+
+
 def container_headroom() -> int | None:
     try:
-        limit = Path("/sys/fs/cgroup/memory.max").read_text().strip()
-        used = Path("/sys/fs/cgroup/memory.current").read_text().strip()
-        return None if limit == "max" else max(0, int(limit) - int(used))
+        root = Path("/sys/fs/cgroup")
+        limit = (root / "memory.max").read_text().strip()
+        used = int((root / "memory.current").read_text())
+        return None if limit == "max" else max(0, int(limit) - working_set(used, root))
     except (FileNotFoundError, ValueError):
         try:
             root = Path("/sys/fs/cgroup/memory")
             limit = int((root / "memory.limit_in_bytes").read_text())
             used = int((root / "memory.usage_in_bytes").read_text())
-            return None if limit > 2**60 else max(0, limit - used)
+            return None if limit > 2**60 else max(0, limit - working_set(used, root, v1=True))
         except (FileNotFoundError, ValueError):
             return None
 

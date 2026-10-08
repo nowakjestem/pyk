@@ -1,6 +1,7 @@
 import asyncio
 import os
 import sys
+from pathlib import Path
 
 import pytest
 from botocore.exceptions import ClientError
@@ -89,6 +90,62 @@ def test_resource_admission_checks_memory_disk_and_workdir(config, monkeypatch):
     )
     with pytest.raises(ResourceWait, match="limit"):
         check_resources(limited)
+
+
+@pytest.mark.parametrize(
+    "version,stats,expected",
+    [
+        (2, "inactive_file 600\nfile_dirty 20\nfile_writeback 10\n", 638),
+        (2, "inactive_file 0\nactive_file 600\n", 68),
+        (2, "inactive_file 600\nfile_dirty 600\n", 68),
+        (2, "inactive_anon 600\nshmem 600\n", 68),
+        (2, None, 68),
+        (2, "inactive_file invalid\n", 68),
+        (1, "total_inactive_file 600\ninactive_file 50\ntotal_dirty 20\ntotal_writeback 10\n", 638),
+        (1, None, 68),
+    ],
+)
+def test_container_headroom_reclaims_only_clean_inactive_file_cache(
+    monkeypatch, version, stats, expected
+):
+    from rolki import resources
+
+    prefix = "/sys/fs/cgroup" if version == 2 else "/sys/fs/cgroup/memory"
+    fixtures = {
+        f"{prefix}/{'memory.max' if version == 2 else 'memory.limit_in_bytes'}": "768",
+        f"{prefix}/{'memory.current' if version == 2 else 'memory.usage_in_bytes'}": "700",
+    }
+    if stats is not None:
+        fixtures[f"{prefix}/memory.stat"] = stats
+
+    def read(path, **_kwargs):
+        if str(path) not in fixtures:
+            raise FileNotFoundError(path)
+        return fixtures[str(path)]
+
+    monkeypatch.setattr(Path, "read_text", read)
+    assert resources.container_headroom() == expected
+
+
+def test_download_page_cache_does_not_block_next_stage(config, monkeypatch):
+    from rolki import resources
+
+    mib = 1024**2
+    fixtures = {
+        "/sys/fs/cgroup/memory.max": str(768 * mib),
+        "/sys/fs/cgroup/memory.current": str(300 * mib),
+        "/sys/fs/cgroup/memory.stat": f"inactive_file {210 * mib}\nfile_dirty 4096\nfile_writeback 0\n",
+    }
+    monkeypatch.setattr(Path, "read_text", lambda path, **_: fixtures[str(path)])
+    monkeypatch.setattr(resources, "available_memory", lambda: 1024 * mib)
+    config = config.model_copy(
+        update={
+            "limits": config.limits.model_copy(
+                update={"min_container_headroom_bytes": 512 * mib},
+            )
+        }
+    )
+    check_resources(config)
 
 
 async def test_cancellation_stops_subprocess(tmp_path):
