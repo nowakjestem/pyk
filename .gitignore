@@ -15,3 +15,4 @@ compose.override.yaml
 dist/
 build/
 .DS_Store
+._*
