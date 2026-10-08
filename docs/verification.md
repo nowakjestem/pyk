@@ -1,9 +1,9 @@
-# Weryfikacja — 8 października 2026
+# Weryfikacja — 8–9 października 2026
 
 ## Środowisko i testy
 
-- Lokalnie Python 3.12.13, po dodaniu API OpenAI: 135 testów przeszło; 8 testów renderowania pominięto, ponieważ lokalny FFmpeg nie ma libass.
-- Na `narcyz`, nowy obraz Docker z Pythonem 3.12, FFmpeg/libass i whisper.cpp v1.8.7: **143 testy przeszły**. Wcześniejsza poprawka granic rozdziałów miała 114 zaliczonych testów i oba zadania CI zakończone powodzeniem.
+- Lokalnie Python 3.12.13, po poprawkach API OpenAI: 144 testy przeszły; 8 testów renderowania pominięto, ponieważ lokalny FFmpeg nie ma libass.
+- Na `narcyz`, nowy obraz Docker z Pythonem 3.12, FFmpeg/libass i whisper.cpp v1.8.7: **152 testy przeszły**. Wcześniejsza poprawka granic rozdziałów miała 114 zaliczonych testów i oba zadania CI zakończone powodzeniem.
 - Kontener testowy miał limit **768 MiB RAM, bez swapu, 2 vCPU**.
 - Lint Ruff, formatowanie i sprawdzenie lockfile zależności zakończyły się powodzeniem.
 - Render sprawdzono przez ffprobe, pełne dekodowanie FFmpeg oraz kontrolę pikseli: oba warianty są pionowe, zachowują audio i granice klipu, a wariant letterbox ma czarne pasy i napisy w dolnym pasie.
@@ -29,7 +29,7 @@ w kontenerze z limitem 768 MiB. Nie wystąpiło OOM.
 
 Rozpoznanie próbki syntetycznej zawierało błędy. Ten pomiar potwierdza działanie i zasoby,
 nie jest oceną jakości na ludzkiej mowie. Użytkownik ocenił również jakość napisów na docelowym
-polskim filmie jako niewystarczającą. Rozważane jest zewnętrzne API większego modelu;
+polskim filmie jako niewystarczającą. Na tej podstawie przygotowano backend OpenAI;
 pełna próba opisana poniżej używała lokalnego modelu base Q5_0.
 
 Raport i filmy na VPS-ie: `/home/nowak/mattermost-rolki/data/benchmark-words/`.
@@ -74,7 +74,7 @@ czasy słów i segmentów. Schemat konfiguracji nadal domyślnie przyjmuje `loca
 ustawienia zadań zapisanych przed tą zmianą. Lato, podświetlanie słów i oba warianty korzystają
 z tego samego formatu Cue/Word. Klucz pochodzi wyłącznie z `OPENAI_API_KEY` w otoczeniu procesu.
 
-29 nowych testów sprawdza prawdziwe żądania multipart do lokalnego serwera testowego:
+Testy adaptera sprawdzają prawdziwe żądania multipart do lokalnego serwera testowego:
 oba poziomy timestampów, język, prompt, ponowne otwarcie audio w retry, błędy autoryzacji,
 budżetu, limitów, timeout, rozmiar uploadu i niepoprawny JSON. Sprawdzono też polskie znaki,
 interpunkcję, granice klipu, czasy względne, ASS obu wariantów oraz pomijanie ciszy.
@@ -82,8 +82,33 @@ Wznowienie po błędzie drugiego fragmentu nie powtarza pierwszego rozpoznanego 
 Klucz nie trafia do konfiguracji zapisanej w SQLite. Kontrola zależności backendu OpenAI
 nie wymaga lokalnego modelu ani binarek Whispera.
 
-Obraz `pyk-openai:ready` zbudowano na VPS-ie z kodu pobranego przez Git, bez przełączania
-działających usług. Podczas tej weryfikacji nie było jeszcze klucza OpenAI, więc nie wykonano
-rzeczywistego płatnego zapytania ani oceny jakości nowego backendu. Aktywacja wymaga klucza
-w `.env`, aktualizacji checkoutu i odtworzenia kontenerów. Sam restart nie wczytuje nowego
-`env_file`. Harmonogram wyłączenia `whisper-1` i instrukcje konfiguracji opisano w README.
+Obraz początkowo przygotowano na VPS-ie z kodu pobranego przez Git, a po dodaniu klucza
+odtworzono oba kontenery, żeby wczytały nowy `env_file`. Zachowano zmiany stylu użytkownika
+przez autostash podczas aktualizacji checkoutu. Backend `openai` jest aktywny dla nowych zadań.
+Harmonogram wyłączenia `whisper-1` i instrukcje konfiguracji opisano w README.
+
+Pierwsza rzeczywista próba została odrzucona przez OpenAI z kodem `credit_balance_exhausted`.
+Po doładowaniu salda przez użytkownika transkrypcja zakończyła się powodzeniem. Dodano
+rozróżnianie braku salda, limitów wydatków organizacji/projektu oraz limitu użycia od
+chwilowych limitów żądań. Błędy rozliczeń nie są ponawiane. Odpowiedź błędu jest odczytywana
+w całości do limitu 4096 bajtów przed klasyfikacją, również przy fragmentowanym HTTP.
+
+Próba wykorzystała 30 sekund polskiej mowy z wcześniejszego klipu. Z wariantu letterbox
+usunięto pasy z wcześniejszymi napisami, aby uzyskać czysty obraz do ponownego renderu.
+
+| Etap | Wynik |
+|---|---:|
+| Długość próbki | 30 s |
+| Transkrypcja OpenAI wraz z wyodrębnieniem audio | 3,81 s |
+| Pierwszy render crop | 8,84 s |
+| Pierwszy render letterbox | 4,78 s |
+
+Oba pliki przeszły kontrolę parametrów i pełne dekodowanie. Wizualna kontrola klatek
+potwierdziła Lato, tło słowa i czytelne napisy w obu wariantach. Rzeczywista odpowiedź API
+ujawniła podział nazwiska z łącznikiem na dwa wpisy słów; parser teraz łączy takie wpisy,
+zachowując ich rzeczywiste granice czasu. Dodano regresję dla nazwiska, osobnej interpunkcji
+oraz niezgodności tekstu bez wymyślania czasów słów. Ponowny render wykorzystuje zapisaną
+transkrypcję i nie wymaga kolejnej opłaty API. Próba sprawdza integrację i renderowanie;
+nie stanowi pełnej oceny jakości rozpoznawania ani ponownego przetworzenia całego filmu.
+
+Raport, transkrypcja i oba filmy są na VPS-ie w `data/openai-verification/`.
