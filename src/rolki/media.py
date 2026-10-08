@@ -66,6 +66,24 @@ async def probe(path: Path) -> dict:
         raise PermanentError("Nie udało się odczytać parametrów filmu.") from exc
 
 
+def chapters_for_source(
+    chapters: list[dict], info: dict, metadata_duration: float
+) -> tuple[list[dict], float]:
+    """YouTube rounds duration to whole seconds; retain the real final frame/audio."""
+    try:
+        duration = float(info["format"]["duration"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise PermanentError("Brak prawidłowej długości pobranego filmu.") from exc
+    if not math.isfinite(duration) or duration <= 0:
+        raise PermanentError("Brak prawidłowej długości pobranego filmu.")
+    if metadata_duration - duration > 1:
+        raise PermanentError("Pobrany film jest krótszy niż metadane YouTube o ponad sekundę.")
+    bounded = [{**chapter, "end": min(chapter["end"], duration)} for chapter in chapters]
+    if any(chapter["end"] <= chapter["start"] for chapter in bounded):
+        raise PermanentError("Rozdział wykracza poza koniec pobranego filmu.")
+    return bounded, duration
+
+
 async def extract_audio(source: Path, destination: Path, start: float, duration: float):
     await run_process(
         [

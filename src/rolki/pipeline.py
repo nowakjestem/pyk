@@ -11,7 +11,7 @@ from pathlib import Path
 from .config import Config
 from .db import Database
 from .errors import PermanentError, ResourceWait, TransientError
-from .media import probe, render, transcribe, validate_chapters
+from .media import chapters_for_source, probe, render, transcribe, validate_chapters
 from .process import retry_network, run_process
 from .resources import check_resources
 from .storage import LocalStorage, S3Storage
@@ -84,6 +84,7 @@ class Pipeline:
             for c in state["chapters"]
         )
         source = root / state.get("source", "source.mkv")
+        source_info = None
         if pending and not source.is_file():
             downloaded = await youtube("download")
             source = root / downloaded["source"]
@@ -92,6 +93,13 @@ class Pipeline:
                 raise PermanentError("Film nie zawiera ścieżki audio.")
             state["source"] = source.name
             save("download_done")
+
+        if pending and "source_duration" not in state:
+            source_info = source_info or await probe(source)
+            state["chapters"], state["source_duration"] = chapters_for_source(
+                state["chapters"], source_info, state["duration"]
+            )
+            save("source_verified")
 
         for chapter in state["chapters"]:
             index = str(chapter["index"])

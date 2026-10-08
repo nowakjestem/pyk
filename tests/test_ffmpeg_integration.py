@@ -5,7 +5,7 @@ import wave
 import pytest
 
 from rolki.config import SubtitleBackground
-from rolki.media import extract_audio, render, silent_audio
+from rolki.media import chapters_for_source, extract_audio, probe, render, silent_audio
 from rolki.process import run_process
 from rolki.subtitles import Cue, Word, write_subtitles
 
@@ -110,6 +110,45 @@ def test_silent_chunk(tmp_path):
         stream.setframerate(16000)
         stream.writeframes(b"\x00\x00" * 16000)
     assert silent_audio(audio)
+
+
+async def test_final_chapter_uses_fractional_source_duration(config, tmp_path, ffmpeg_available):
+    source = tmp_path / "source.mp4"
+    await run_process(
+        [
+            "ffmpeg",
+            "-nostdin",
+            "-v",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=red:s=640x360:r=30:d=2.54",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:sample_rate=16000:duration=2.54",
+            "-c:v",
+            "libx264",
+            "-threads",
+            "2",
+            "-c:a",
+            "aac",
+            "-shortest",
+            str(source),
+        ],
+        timeout=60,
+    )
+    info = await probe(source)
+    chapters, duration = chapters_for_source([{"start": 2, "end": 3}], info, 3)
+    assert 2.5 < duration < 2.7
+    write_subtitles(
+        [Cue(0, duration - 2, "Koniec filmu")], tmp_path, config.subtitles, config.video
+    )
+    for variant in ("crop", "letterbox"):
+        output = await render(source, chapters[0], tmp_path, config, variant)
+        assert abs(float((await probe(output))["format"]["duration"]) - (duration - 2)) < 0.1
 
 
 def subtitle_frame(root, variant, time):

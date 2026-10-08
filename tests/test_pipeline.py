@@ -35,7 +35,7 @@ def fake_media(monkeypatch):
         (root / f"{operation}.json").write_text(json.dumps(result))
 
     async def probe(_source):
-        return {"streams": [{"codec_type": "audio"}]}
+        return {"streams": [{"codec_type": "audio"}], "format": {"duration": "20"}}
 
     async def transcribe(_source, _chapter, _root, _config):
         calls["transcribe"] += 1

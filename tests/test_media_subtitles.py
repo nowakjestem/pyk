@@ -6,7 +6,7 @@ from pydantic import ValidationError
 
 from rolki.config import SubtitleBackground, Subtitles
 from rolki.errors import PermanentError
-from rolki.media import validate_chapters, video_filter
+from rolki.media import chapters_for_source, validate_chapters, video_filter
 from rolki.subtitles import (
     Cue,
     Word,
@@ -34,6 +34,27 @@ def test_chapters_last_end():
         {"index": 0, "title": "Początek", "start": 0, "end": 10},
         {"index": 1, "title": "Koniec", "start": 10, "end": 30},
     ]
+
+
+def test_chapters_bound_rounded_youtube_end_to_real_source():
+    chapters = [{"index": 0, "start": 0, "end": 835}, {"index": 1, "start": 835, "end": 854}]
+    adjusted, duration = chapters_for_source(chapters, {"format": {"duration": "853.541"}}, 854)
+    assert duration == 853.541
+    assert adjusted[0] == chapters[0]
+    assert adjusted[-1]["end"] == 853.541
+    assert chapters[-1]["end"] == 854
+
+
+@pytest.mark.parametrize("duration", ["nan", "inf", "0", "-1", "850", None])
+def test_invalid_or_truncated_source_duration_is_rejected(duration):
+    with pytest.raises(PermanentError):
+        chapters_for_source([{"start": 835, "end": 854}], {"format": {"duration": duration}}, 854)
+
+
+def test_source_does_not_extend_chapter_boundaries():
+    chapters = [{"start": 0, "end": 10}]
+    adjusted, _ = chapters_for_source(chapters, {"format": {"duration": 11}}, 10)
+    assert adjusted == chapters
 
 
 @pytest.mark.parametrize(
