@@ -83,6 +83,7 @@ def test_queue_position_counts_active_jobs_but_not_finished_or_local(db, config,
 def test_old_outbox_migrates_and_preserves_pending_notifications(tmp_path):
     path = tmp_path / "legacy.sqlite"
     with sqlite3.connect(path) as connection:
+        connection.execute("PRAGMA journal_mode=WAL")
         connection.executescript("""
         CREATE TABLE outbox (
           id TEXT PRIMARY KEY, job_id TEXT, event_key TEXT, channel_id TEXT, root_id TEXT,
@@ -93,7 +94,9 @@ def test_old_outbox_migrates_and_preserves_pending_notifications(tmp_path):
         INSERT INTO outbox (id, job_id, event_key, message, created_at)
           VALUES ('old', 'job', 'accepted', 'legacy', 0);
         """)
-    database = Database(path)
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        databases = list(pool.map(lambda _: Database(path), range(8)))
+    database = databases[0]
     Database(path)  # Migration is safe on a second startup.
     old = database.pending_notifications()[0]
     assert old["message"] == "legacy" and old["update_of"] is None

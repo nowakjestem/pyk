@@ -40,6 +40,7 @@ class Database:
         with self.connect() as db:
             db.execute("PRAGMA journal_mode=WAL")
             db.executescript(SCHEMA)
+            db.execute("BEGIN IMMEDIATE")  # Bot and worker may migrate together at startup.
             if "local_output" not in {row[1] for row in db.execute("PRAGMA table_info(jobs)")}:
                 db.execute("ALTER TABLE jobs ADD COLUMN local_output TEXT")
             if "update_of" not in {row[1] for row in db.execute("PRAGMA table_info(outbox)")}:

@@ -2,8 +2,8 @@
 
 ## Środowisko i testy
 
-- Lokalnie Python 3.12.13, po dodaniu współbieżności GPT: 167 testów przeszło; 8 testów renderowania pominięto, ponieważ lokalny FFmpeg nie ma libass.
-- Na `narcyz`, nowy obraz Docker z Pythonem 3.12, FFmpeg/libass i whisper.cpp v1.8.7: **175 testów przeszło**. Oba zadania GitHub Actions dla wcześniejszej zmiany GPT (`699114e`, 163 testy) zakończyły się powodzeniem. Backend OpenAI Whisper miał wcześniej 152 zaliczone testy.
+- Lokalnie Python 3.12.13, po zmianie komunikacji Mattermosta: 174 testy przeszły; 8 testów renderowania pominięto, ponieważ lokalny FFmpeg nie ma libass.
+- Na `narcyz`, nowy obraz Docker z Pythonem 3.12, FFmpeg/libass i whisper.cpp v1.8.7: **182 testy przeszły**. Współbieżność GPT miała wcześniej 175 zaliczonych testów. Oba zadania GitHub Actions dla wcześniejszej zmiany GPT (`699114e`, 163 testy) zakończyły się powodzeniem. Backend OpenAI Whisper miał wcześniej 152 zaliczone testy.
 - Kontener testowy miał limit **768 MiB RAM, bez swapu, 2 vCPU**.
 - Lint Ruff, formatowanie i sprawdzenie lockfile zależności zakończyły się powodzeniem.
 - Render sprawdzono przez ffprobe, pełne dekodowanie FFmpeg oraz kontrolę pikseli: oba warianty są pionowe, zachowują audio i granice klipu, a wariant letterbox ma czarne pasy i napisy w dolnym pasie.
@@ -171,3 +171,26 @@ kolejności oraz brak pozostałych tymczasowych plików WAV. Transkrypcja z wyod
 audio zajęła **2,27 s**, wobec wcześniejszych 4,58 s przy jednym zapytaniu naraz.
 To pojedynczy pomiar przy różnym obciążeniu API/VPS-a, nie gwarancja przyspieszenia
 całego filmu. Raport i transkrypcja: `data/gpt-parallel-verification/` na VPS-ie.
+
+## Komunikacja Mattermosta
+
+Bot ignoruje posty z niepustym `root_id`, zarówno ze strumienia WebSocket, jak i podczas
+REST backfill. Główne wiadomości nadal tworzą zadania, a odpowiedzi bota pozostają w ich
+wątkach. Testy obejmują ignorowanie odpowiedzi użytkownika oraz przesunięcie kursora
+synchronizacji mimo pominiętej odpowiedzi.
+
+Przyjęcie zadania zapisuje jego miejsce w kolejce i jedno potwierdzenie. Miejsce liczone
+jest atomowo, z trwającymi oraz oczekującymi zadaniami usługowymi; ukończone, nieudane
+i zadania z lokalnym outputem nie są liczone. Po pobraniu metadanych worker zleca edycję
+potwierdzenia o tytuł, liczbę rozdziałów i rozpoczęcie przetwarzania, zamiast kolejnego posta.
+
+Outbox ma nullable `update_of`; starsze wpisy zachowują sposób dostarczania. Migracja
+jest blokowana transakcją, aby bot i worker mogli startować jednocześnie. Przed wdrożeniem
+utworzono spójny backup SQLite na VPS-ie. Test sprawdza migrację starszego schematu przy
+równoczesnym starcie i zachowanie oczekujących powiadomień.
+
+Aktualizacja czeka na potwierdzony identyfikator pierwszego posta. Test utraty odpowiedzi
+HTTP po POST potwierdza odzyskanie identyfikatora przed edycją. Ponowienie po niejednoznacznym
+PUT edytuje ten sam post; nie tworzy drugiego i zachowuje fingerprint potwierdzenia oraz
+jego wątek. Nieudana edycja nie przełącza się na zastępczy POST. Klient serwera na VPS-ie
+zwrócił `PostEditTimeLimit: -1`; nie zmieniano ustawień Mattermosta.
