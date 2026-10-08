@@ -2,8 +2,8 @@
 
 ## Środowisko i testy
 
-- Lokalnie Python 3.12.13: 106 testów przeszło; 8 testów renderowania pominięto, ponieważ lokalny FFmpeg nie ma libass.
-- Na `narcyz`, obraz Docker z Pythonem 3.12, FFmpeg/libass i whisper.cpp v1.8.7: **114 testów przeszło**. Oba zadania CI dla poprawki granic rozdziałów również zakończyły się powodzeniem.
+- Lokalnie Python 3.12.13, po dodaniu API OpenAI: 135 testów przeszło; 8 testów renderowania pominięto, ponieważ lokalny FFmpeg nie ma libass.
+- Na `narcyz`, nowy obraz Docker z Pythonem 3.12, FFmpeg/libass i whisper.cpp v1.8.7: **143 testy przeszły**. Wcześniejsza poprawka granic rozdziałów miała 114 zaliczonych testów i oba zadania CI zakończone powodzeniem.
 - Kontener testowy miał limit **768 MiB RAM, bez swapu, 2 vCPU**.
 - Lint Ruff, formatowanie i sprawdzenie lockfile zależności zakończyły się powodzeniem.
 - Render sprawdzono przez ffprobe, pełne dekodowanie FFmpeg oraz kontrolę pikseli: oba warianty są pionowe, zachowują audio i granice klipu, a wariant letterbox ma czarne pasy i napisy w dolnym pasie.
@@ -30,7 +30,7 @@ w kontenerze z limitem 768 MiB. Nie wystąpiło OOM.
 Rozpoznanie próbki syntetycznej zawierało błędy. Ten pomiar potwierdza działanie i zasoby,
 nie jest oceną jakości na ludzkiej mowie. Użytkownik ocenił również jakość napisów na docelowym
 polskim filmie jako niewystarczającą. Rozważane jest zewnętrzne API większego modelu;
-obecny kod nadal używa lokalnego modelu base Q5_0.
+pełna próba opisana poniżej używała lokalnego modelu base Q5_0.
 
 Raport i filmy na VPS-ie: `/home/nowak/mattermost-rolki/data/benchmark-words/`.
 Lokalne podglądy: `artifacts/verification/word-background/` (poza Git).
@@ -66,3 +66,24 @@ Wznowienie zachowało 12 już opublikowanych klipów i dokończyło dwa brakują
 wysyłania wcześniejszych wyników. W trakcie renderowania obserwowano około 370 MiB pamięci
 workera; nie wystąpiły zdarzenia OOM. Swap nie został dodany. Końcowy dostępny RAM hosta
 wynosił około 1 GiB. Próba dotyczyła filmu krótszego niż planowane około 20 minut tygodniowo.
+
+## Integracja bezpośredniego API OpenAI
+
+Dodano backend `openai`, domyślnie wybrany w YAML, z modelem `whisper-1` zwracającym tekst,
+czasy słów i segmentów. Schemat konfiguracji nadal domyślnie przyjmuje `local`, aby zachować
+ustawienia zadań zapisanych przed tą zmianą. Lato, podświetlanie słów i oba warianty korzystają
+z tego samego formatu Cue/Word. Klucz pochodzi wyłącznie z `OPENAI_API_KEY` w otoczeniu procesu.
+
+29 nowych testów sprawdza prawdziwe żądania multipart do lokalnego serwera testowego:
+oba poziomy timestampów, język, prompt, ponowne otwarcie audio w retry, błędy autoryzacji,
+budżetu, limitów, timeout, rozmiar uploadu i niepoprawny JSON. Sprawdzono też polskie znaki,
+interpunkcję, granice klipu, czasy względne, ASS obu wariantów oraz pomijanie ciszy.
+Wznowienie po błędzie drugiego fragmentu nie powtarza pierwszego rozpoznanego fragmentu.
+Klucz nie trafia do konfiguracji zapisanej w SQLite. Kontrola zależności backendu OpenAI
+nie wymaga lokalnego modelu ani binarek Whispera.
+
+Obraz `pyk-openai:ready` zbudowano na VPS-ie z kodu pobranego przez Git, bez przełączania
+działających usług. Podczas tej weryfikacji nie było jeszcze klucza OpenAI, więc nie wykonano
+rzeczywistego płatnego zapytania ani oceny jakości nowego backendu. Aktywacja wymaga klucza
+w `.env`, aktualizacji checkoutu i odtworzenia kontenerów. Sam restart nie wczytuje nowego
+`env_file`. Harmonogram wyłączenia `whisper-1` i instrukcje konfiguracji opisano w README.
