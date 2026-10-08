@@ -88,6 +88,36 @@ def test_words_only_response_and_silence():
     assert parse_openai({"text": "", "segments": [], "words": []}, duration=2) == []
 
 
+def test_hyphenated_surname_joins_api_entries_using_real_boundaries():
+    document = {
+        "text": "Agnieszka Dziemianowicz-Bąk wyszła.",
+        "segments": [{"start": 0, "end": 3, "text": "Agnieszka Dziemianowicz-Bąk wyszła."}],
+        "words": [
+            {"start": 0, "end": 0.5, "word": "Agnieszka"},
+            {"start": 0.5, "end": 1, "word": "Dziemianowicz"},
+            {"start": 1, "end": 1.4, "word": "Bąk"},
+            {"start": 1.8, "end": 2.2, "word": "wyszła"},
+            {"start": 2.8, "end": 3, "word": "."},
+        ],
+    }
+    cue = parse_openai(document, duration=3)[0]
+    assert cue.words == (
+        Word(0, 0.5, "Agnieszka"),
+        Word(0.5, 1.4, "Dziemianowicz-Bąk"),
+        Word(1.8, 2.2, "wyszła."),
+    )
+
+
+@pytest.mark.parametrize("api_text", ["inne", "dwasłowa"])
+def test_word_matching_does_not_relabel_or_split_unknown_speech(api_text):
+    document = {
+        "text": "dwa słowa",
+        "segments": [{"start": 0, "end": 2, "text": "dwa słowa"}],
+        "words": [{"start": 0, "end": 2, "word": api_text}],
+    }
+    assert parse_openai(document, duration=2) == [Cue(0, 2, "dwa słowa")]
+
+
 @pytest.mark.parametrize(
     "document",
     [

@@ -31,13 +31,31 @@ def _match_words(text: str, words: tuple[Word, ...]) -> tuple[Word, ...]:
     def normalize(token):
         return re.sub(r"[^\w]", "", token).casefold()
 
-    if len(tokens) != len(words) or any(
-        normalize(token) != normalize(word.text) for token, word in zip(tokens, words, strict=True)
-    ):
+    matched = []
+    index = 0
+    for token in tokens:
+        expected = normalize(token)
+        if not expected:
+            return ()
+        pieces = []
+        combined = ""
+        while index < len(words) and combined != expected:
+            word = words[index]
+            index += 1
+            value = normalize(word.text)
+            if not value:
+                continue  # Punctuation must not extend a spoken word through a pause.
+            combined += value
+            if not expected.startswith(combined):
+                return ()
+            pieces.append(word)
+        if combined != expected or not pieces:
+            return ()
+        # OpenAI may split a hyphenated surname into two timed entries.
+        matched.append(Word(pieces[0].start, pieces[-1].end, token))
+    if any(normalize(word.text) for word in words[index:]):
         return ()
-    return tuple(
-        Word(word.start, word.end, token) for token, word in zip(tokens, words, strict=True)
-    )
+    return tuple(matched)
 
 
 def parse_openai(document: dict, *, offset: float = 0, duration: float) -> list[Cue]:
