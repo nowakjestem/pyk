@@ -10,7 +10,7 @@ import pytest
 from aiohttp import web
 from pydantic import ValidationError
 
-from rolki.buffer import AmbiguousResult, BufferClient, post_input, queue_fits_retention
+from rolki.buffer import AmbiguousResult, BufferClient, QueueFull, post_input, queue_fits_retention
 from rolki.buffer_publisher import BufferPublisher
 from rolki.buffer_store import BufferStore
 from rolki.config import Buffer, BufferSchedule, Config
@@ -252,6 +252,7 @@ class FakeClient:
     def __init__(self):
         self.created, self.remote = [], []
         self.failure = None
+        self.limit = 10
         self.queue_times = {
             c: NOW.timestamp() + (10 + i) * 86400 for i, c in enumerate(("ig", "tt", "yt"))
         }
@@ -269,6 +270,9 @@ class FakeClient:
 
     async def verify_channels(self, _settings):
         return self.accounts
+
+    async def queue_limit(self, _settings):
+        return self.limit
 
     async def posts(self, _settings):
         return [dict(p) for p in self.remote]
@@ -345,6 +349,179 @@ async def test_native_queue_uses_actual_different_dates_beyond_seven_days(
     assert store.deliveries(job_id, 0)[0]["due_at"] == NOW.timestamp() + 16 * 86400
     assert "25.10.2026" in store.message(job_id, 0)
     assert len(client.created) == 3
+
+
+async def test_capacity_ten_per_channel_waits_and_refills_without_new_approval(
+    db, queue_config, monkeypatch
+):
+    job_id = prepare(db, queue_config, count=12)
+    p, client = publisher(db, monkeypatch)
+    await p.tick(now=NOW.timestamp())
+    assert len(client.created) == 30
+    for channel in ("ig", "tt", "yt"):
+        assert sum(r["channelId"] == channel for r in client.created) == 10
+        waiting = [
+            d
+            for index in range(12)
+            for d in p.store.deliveries(job_id, index)
+            if d["channel_id"] == channel and d["status"] == "waiting_capacity"
+        ]
+        assert len(waiting) == 2 and all(d["attempts"] == 0 for d in waiting)
+    assert "czeka na wolne miejsce" in p.store.message(job_id, 11)
+    restarted = BufferPublisher(db, client)
+    monkeypatch.setattr(restarted, "check_media", p.check_media)
+    await restarted.tick(now=NOW.timestamp() + 30)
+    assert len(client.created) == 30
+    for channel in ("ig", "tt", "yt"):
+        published = [post for post in client.remote if post["channelId"] == channel][:2]
+        for post in published:
+            post["status"] = "sent"
+    await restarted.tick(now=NOW.timestamp() + 3601)
+    assert len(client.created) == 36
+    assert all(
+        d["status"] in ("scheduled", "sent")
+        for index in range(12)
+        for d in p.store.deliveries(job_id, index)
+    )
+    assert all(
+        sum(
+            post["channelId"] == channel and post["status"] == "scheduled" for post in client.remote
+        )
+        == 10
+        for channel in ("ig", "tt", "yt")
+    )
+
+
+async def test_capacity_counts_manual_posts_and_parts_but_platforms_are_independent(
+    db, queue_config, monkeypatch
+):
+    job_id = prepare(db, queue_config, approve=False)
+    add_parts(db, job_id)
+    store = BufferStore(db)
+    store.accept(f"clip-{job_id}-0", "scissors", "member")
+    p, client = publisher(db, monkeypatch)
+    for n in range(9):
+        client.remote.append(
+            {
+                "id": f"manual-{n}",
+                "channelId": "ig",
+                "status": "scheduled",
+                "dueAt": (NOW + timedelta(days=1)).isoformat(),
+            }
+        )
+    client.remote += [
+        {"id": "draft", "channelId": "ig", "status": "draft"},
+        {"id": "old", "channelId": "ig", "status": "sent"},
+    ]
+    await p.tick(now=NOW.timestamp())
+    assert len(client.created) == 5
+    instagram = [d for d in store.deliveries(job_id, 0) if d["channel_id"] == "ig"]
+    assert [d["status"] for d in instagram] == ["scheduled", "waiting_capacity"]
+    assert all(
+        d["status"] == "scheduled" for d in store.deliveries(job_id, 0) if d["channel_id"] != "ig"
+    )
+    client.remote = [post for post in client.remote if post["id"] != "manual-0"]
+    await p.tick(now=NOW.timestamp() + 3601)
+    assert len(client.created) == 6
+    assert all(d["status"] == "scheduled" for d in store.deliveries(job_id, 0))
+
+
+async def test_unknown_write_reserves_capacity_even_when_missing_from_api(
+    db, queue_config, monkeypatch
+):
+    first = prepare(db, queue_config)
+    second = prepare(db, queue_config, post="second")
+    p, client = publisher(db, monkeypatch)
+    client.limit = 1
+    client.failure = lambda _request: AmbiguousResult("Utracono odpowiedź")
+    await p.tick(now=NOW.timestamp())
+    assert len(client.created) == 3
+    assert all(d["status"] == "unknown" for d in p.store.deliveries(first, 0))
+    assert all(d["status"] == "waiting_capacity" for d in p.store.deliveries(second, 0))
+
+
+async def test_definitive_limit_race_waits_beyond_three_checks_and_uses_api_limit(
+    db, queue_config, monkeypatch
+):
+    job_id = prepare(db, queue_config)
+    p, client = publisher(db, monkeypatch)
+    client.limit = 2
+    client.failure = lambda request: (
+        QueueFull("Buffer zgłosił limit") if request["channelId"] == "tt" else None
+    )
+    for hour in range(4):
+        await p.tick(now=NOW.timestamp() + hour * 3601)
+    deliveries = p.store.deliveries(job_id, 0)
+    assert [d["status"] for d in deliveries] == ["scheduled", "waiting_capacity", "scheduled"]
+    assert deliveries[1]["attempts"] == 0 and deliveries[1]["request_json"] is None
+    client.failure = None
+    await p.tick(now=NOW.timestamp() + 4 * 3601)
+    assert all(d["status"] == "scheduled" for d in p.store.deliveries(job_id, 0))
+    assert [r["channelId"] for r in client.created].count("ig") == 1
+
+
+async def test_waiting_capacity_rechecks_file_expiry(db, queue_config, monkeypatch):
+    job_id = prepare(db, queue_config)
+    p, client = publisher(db, monkeypatch)
+    client.failure = lambda _request: QueueFull("Limit")
+    await p.tick(now=NOW.timestamp())
+    assert all(d["status"] == "waiting_capacity" for d in p.store.deliveries(job_id, 0))
+    client.failure = None
+    await p.tick(now=NOW.timestamp() + 29 * 86400)
+    assert len(client.created) == 3
+    assert all(
+        d["status"] == "failed" and "Retencja" in d["detail"] for d in p.store.deliveries(job_id, 0)
+    )
+
+
+async def test_legacy_custom_timestamp_replans_after_waiting_for_capacity(
+    db, buffer_config, monkeypatch
+):
+    job_id = prepare(db, buffer_config)
+    p, client = publisher(db, monkeypatch)
+    client.failure = lambda _request: QueueFull("Limit")
+    await p.tick(now=NOW.timestamp())
+    assert all(d["status"] == "waiting_capacity" for d in p.store.deliveries(job_id, 0))
+    client.failure = None
+    late = NOW.timestamp() + 8 * 86400
+    await p.tick(now=late)
+    assert all(d["status"] == "scheduled" for d in p.store.deliveries(job_id, 0))
+    assert p.store.plan(job_id, 0)["due_at"] > late
+
+
+async def test_real_graphql_queue_limit_and_typed_limit_error(queue_config):
+    async def handler(request):
+        body = await request.json()
+        if "scheduledPosts" in body["query"]:
+            return web.json_response(
+                {
+                    "data": {
+                        "account": {
+                            "organizations": [
+                                {"id": "other", "limits": {"scheduledPosts": 999}},
+                                {"id": "org", "limits": {"scheduledPosts": 10}},
+                            ]
+                        }
+                    }
+                }
+            )
+        return web.json_response(
+            {
+                "data": {
+                    "createPost": {
+                        "__typename": "LimitReachedError",
+                        "message": "private upstream detail",
+                    }
+                }
+            }
+        )
+
+    async with http_server(handler) as endpoint, aiohttp.ClientSession() as session:
+        client = BufferClient(session, endpoint=endpoint)
+        assert await client.queue_limit(queue_config.buffer) == 10
+        with pytest.raises(QueueFull) as exc:
+            await client.create({"channelId": "ig"})
+        assert "private upstream detail" not in str(exc.value)
 
 
 @pytest.mark.parametrize("problem", ["empty", "paused", "tail", "expired"])

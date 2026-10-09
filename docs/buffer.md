@@ -98,6 +98,25 @@ lokalnej kolejki i obsługę nowych reakcji, ale nie anuluje wpisów już przyj�
 
 ## Terminy i limity
 
+Limit kolejki jest odczytywany z API organizacji Buffera, a nie wpisany na sztywno.
+W planie Free to [10 zaplanowanych materiałów na każde konto](https://buffer.com/pricing),
+łącznie z wpisami dodanymi ręcznie. Każda część segmentu zajmuje jedno miejsce.
+Pyk liczy wpisy zaplanowane, wysyłane i oczekujące na akceptację oraz rezerwuje
+miejsce dla wysyłek o nieznanym wyniku, których API może jeszcze nie pokazywać.
+Robocze szkice i opublikowane materiały nie zajmują miejsc w tej kontroli.
+
+Po zapełnieniu kolejki zatwierdzony klip pozostaje w SQLite ze statusem
+`waiting_capacity`; Mattermost pokazuje „czeka na wolne miejsce w Bufferze”.
+Pyk sprawdza dostępność ponownie co `status_poll_seconds` (domyślnie godzinę), także
+po restarcie. Publikacja lub usunięcie wpisu zwalnia miejsce, a Pyk wysyła kolejny
+materiał bez ponownej reakcji. Pełne konto nie blokuje pozostałych platform.
+Jednoznaczna odpowiedź API `LimitReachedError`, np. po równoległym dodaniu wpisu
+w UI, również powoduje oczekiwanie, bez wyczerpywania trzech prób wysyłki.
+Pozostałe błędy i nieznane wyniki zachowują dotychczasową obsługę.
+Przed wznowieniem nadal sprawdzamy dostępność filmu do terminu publikacji;
+zbyt długie oczekiwanie może wymagać ponownego przygotowania wygasłego pliku.
+Wysyłki już zakończone błędem w starszej wersji wymagają `buffer-retry`.
+
 Buffer wybiera termin osobno dla każdego konta; Instagram, TikTok i YouTube mogą
 opublikować klip w różnych godzinach. Pyk nie podaje `dueAt`, nie losuje minut i nie
 rezerwuje slotów przed reakcją. `schedule.timezone` służy do wyświetlania terminów
@@ -160,6 +179,7 @@ Pyk nie usuwa przyjętego wpisu i nie tworzy go ponownie.
 Wiadomość z linkami pokazuje wybrany wariant, datę i wynik per konto:
 
 - oczekuje — czeka na opis lub wykonanie próby;
+- czeka na wolne miejsce w Bufferze — zatwierdzony klip pozostaje w lokalnej kolejce;
 - wysyłanie — trwa tworzenie wpisu;
 - zaplanowano — Buffer potwierdził automatyczny wpis z filmem i terminem;
 - opublikowano / błąd publikacji — wynik odczytany z Buffera;

@@ -14,6 +14,7 @@ import aiohttp
 from .buffer import (
     AmbiguousResult,
     BufferClient,
+    QueueFull,
     matches,
     post_input,
     queue_fits_retention,
@@ -129,7 +130,7 @@ class BufferPublisher:
                 post_id=post["id"],
             )
 
-    async def process(self, plan, config, external, now, channels=None):
+    async def process(self, plan, config, external, now, channels=None, queue_limit=None):
         job_id, index = plan["job_id"], plan["chapter_index"]
         deliveries = self.store.deliveries(job_id, index)
         state = json.loads(plan["checkpoint"])
@@ -168,7 +169,7 @@ class BufferPublisher:
         pending = [
             d
             for d in self.store.deliveries(job_id, index)
-            if d["status"] == "pending" and d["retry_at"] <= now
+            if d["status"] in ("pending", "waiting_capacity") and d["retry_at"] <= now
         ]
         if (
             not pending
@@ -253,10 +254,20 @@ class BufferPublisher:
                     )
                 expires = media.get("expires_at")
                 margin = config.buffer.retention_margin_hours * 3600
-                if not expires or (custom and due + margin >= expires):
+                if not expires or expires <= now + margin or (custom and due + margin >= expires):
                     raise PermanentError(
                         "Retencja S3 nie zapewnia dostępności filmu do terminu publikacji z zapasem."
                     )
+                used = self.store.capacity_used(config.buffer, external, target.id)
+                if queue_limit is not None and used >= queue_limit:
+                    self.delivery_status(
+                        plan,
+                        d,
+                        "waiting_capacity",
+                        f"Kolejka Buffera pełna ({used}/{queue_limit}); klip pozostaje w Pyk i zostanie wysłany po zwolnieniu miejsca.",
+                        retry_at=now + config.buffer.status_poll_seconds,
+                    )
+                    continue
                 if not custom:
                     account = (channels or {}).get(target.id)
                     if (
@@ -286,6 +297,16 @@ class BufferPublisher:
                 external.append(post)
             except AmbiguousResult as exc:
                 self.delivery_status(plan, d, "unknown", str(exc))
+            except QueueFull as exc:
+                self.delivery_status(
+                    plan,
+                    d,
+                    "waiting_capacity",
+                    str(exc),
+                    attempts=d["attempts"],
+                    request_json=None,
+                    retry_at=now + config.buffer.status_poll_seconds,
+                )
             except TransientError as exc:
                 attempts = d["attempts"] + 1
                 self.delivery_status(
@@ -316,11 +337,15 @@ class BufferPublisher:
     async def tick(self, *, now=None):
         now = time.time() if now is None else now
         cache = {}
-        for plan in self.store.plans(accepted=True):
+        limits = {}
+        for plan in sorted(
+            self.store.plans(accepted=True),
+            key=lambda p: (p["accepted_at"], p["job_id"], p["chapter_index"]),
+        ):
             config = Config.model_validate_json(plan["config_json"])
             deliveries = self.store.deliveries(plan["job_id"], plan["chapter_index"])
             actionable = any(
-                d["status"] == "pending"
+                d["status"] in ("pending", "waiting_capacity")
                 and d["retry_at"] <= now
                 and not any(
                     previous["channel_id"] == d["channel_id"]
@@ -350,8 +375,14 @@ class BufferPublisher:
                 if cache_key not in cache:
                     channels = await self.client.verify_channels(config.buffer)
                     cache[cache_key] = (channels, await self.client.posts(config.buffer))
+                if config.buffer.organization_id not in limits:
+                    limits[config.buffer.organization_id] = await self.client.queue_limit(
+                        config.buffer
+                    )
                 channels, external = cache[cache_key]
-                await self.process(plan, config, external, now, channels)
+                await self.process(
+                    plan, config, external, now, channels, limits[config.buffer.organization_id]
+                )
                 for d in self.store.deliveries(plan["job_id"], plan["chapter_index"]):
                     if d["status"] in ("scheduled", "unknown"):
                         self.delivery_status(
@@ -364,7 +395,15 @@ class BufferPublisher:
             except (PermanentError, TransientError) as exc:
                 log.warning("Buffer preflight failure_type=%s", type(exc).__name__)
                 for d in deliveries:
-                    if d["status"] == "pending":
+                    if d["status"] == "waiting_capacity":
+                        self.delivery_status(
+                            plan,
+                            d,
+                            "failed" if isinstance(exc, PermanentError) else "waiting_capacity",
+                            str(exc),
+                            retry_at=now + config.buffer.status_poll_seconds,
+                        )
+                    elif d["status"] == "pending":
                         attempts = d["attempts"] + 1
                         terminal = isinstance(exc, PermanentError) or attempts >= 3
                         self.delivery_status(

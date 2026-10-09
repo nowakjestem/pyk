@@ -19,6 +19,10 @@ class AmbiguousResult(JobError):
     """A mutation may have succeeded; never automatically repeat it."""
 
 
+class QueueFull(JobError):
+    """Buffer definitively refused a write because a posting limit was reached."""
+
+
 class BufferClient:
     def __init__(self, session: aiohttp.ClientSession, *, endpoint: str = ENDPOINT):
         self.session, self.endpoint = session, endpoint
@@ -97,6 +101,17 @@ class BufferClient:
             )
         )["channels"]
 
+    async def queue_limit(self, settings: Buffer):
+        data = await self.request(
+            "query { account { organizations { id limits { scheduledPosts } } } }"
+        )
+        for organization in data["account"]["organizations"]:
+            if organization["id"] == settings.organization_id:
+                limit = organization.get("limits", {}).get("scheduledPosts")
+                if isinstance(limit, int) and not isinstance(limit, bool) and limit > 0:
+                    return limit
+        raise PermanentError("Nie udało się odczytać limitu kolejki organizacji Buffera.")
+
     async def verify_channels(self, settings: Buffer):
         available = {c["id"]: c for c in await self.channels(settings.organization_id)}
         for target in settings.channels:
@@ -156,6 +171,8 @@ class BufferClient:
             payload.get("post"), dict
         ):
             return payload["post"]
+        if payload.get("__typename") == "LimitReachedError":
+            raise QueueFull("Buffer zgłosił limit publikacji; oczekiwanie na wolne miejsce.")
         if payload.get("message"):
             raise PermanentError(
                 "Buffer odrzucił publikację; sprawdź format, uprawnienia i limity konta."

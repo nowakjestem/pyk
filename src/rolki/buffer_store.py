@@ -56,6 +56,41 @@ class BufferStore:
             ).fetchone()
             return dict(row) if row else None
 
+    def capacity_used(self, settings, external, channel_id):
+        from .buffer import matches
+
+        remote_ids = {p["id"] for p in external}
+        occupied = {
+            ("remote", p["id"])
+            for p in external
+            if p.get("channelId") == channel_id
+            and p.get("status") in ("scheduled", "sending", "needs_approval")
+        }
+        # A missing response can hide a successful create from the latest read.
+        # Reserve those writes locally too, without counting visible posts twice.
+        with self.db.connect() as db:
+            for row in db.execute(
+                "SELECT d.*,j.config_json FROM buffer_deliveries d JOIN jobs j ON j.id=d.job_id WHERE d.channel_id=? AND d.status IN ('scheduled','sending','unknown')",
+                (channel_id,),
+            ):
+                if (
+                    Config.model_validate_json(row["config_json"]).buffer.organization_id
+                    != settings.organization_id
+                ):
+                    continue
+                if row["post_id"] in remote_ids:
+                    continue
+                if row["request_json"] and any(
+                    matches(p, json.loads(row["request_json"])) for p in external
+                ):
+                    continue
+                occupied.add(
+                    ("remote", row["post_id"])
+                    if row["post_id"]
+                    else ("local", row["job_id"], row["chapter_index"], row["part_index"])
+                )
+        return len(occupied)
+
     @staticmethod
     def occupied(db, settings, external, *, exclude=None):
         remote = {p["id"]: p for p in external}
@@ -215,6 +250,7 @@ class BufferStore:
             summary += f" Wybrano: **{plan['variant']}**."
             labels = {
                 "pending": "oczekuje",
+                "waiting_capacity": "czeka na wolne miejsce w Bufferze",
                 "sending": "wysyłanie",
                 "scheduled": "zaplanowano",
                 "unknown": "wynik nieznany — sprawdź Buffer",
@@ -278,7 +314,7 @@ class BufferStore:
             if not plan or (unapproved_only and plan["variant"] is not None):
                 return False
             if db.execute(
-                "SELECT 1 FROM buffer_deliveries WHERE job_id=? AND chapter_index=? AND status NOT IN ('pending','failed')",
+                "SELECT 1 FROM buffer_deliveries WHERE job_id=? AND chapter_index=? AND status NOT IN ('pending','failed','waiting_capacity')",
                 (job_id, index),
             ).fetchone():
                 return False
