@@ -102,6 +102,19 @@ def parser():
     resume = commands.add_parser("resume", help="Wznowienie zadania CLI, także lokalnego")
     resume.add_argument("id")
     commands.add_parser("retry-notifications")
+    commands.add_parser("buffer-accounts", help="Odczyt organizacji i kont Buffera")
+    commands.add_parser("buffer-queue", help="Stan publikacji Buffera w lokalnej kolejce")
+    buffer_retry = commands.add_parser(
+        "buffer-retry", help="Ponowienie jednoznacznie nieudanej wysyłki"
+    )
+    buffer_retry.add_argument("id")
+    buffer_retry.add_argument("chapter", type=int, help="Numer rozdziału, od 1")
+    buffer_retry.add_argument("channel_id")
+    buffer_retry.add_argument(
+        "--confirmed-not-created",
+        action="store_true",
+        help="Operator sprawdził, że niejednoznaczna wysyłka nie utworzyła wpisu w Bufferze",
+    )
     health = commands.add_parser("health")
     health.add_argument("--worker", action="store_true")
     commands.add_parser("model-download")
@@ -117,6 +130,14 @@ async def async_main(args, config):
         if args.integrations:
             config.require_integrations()
             config.require_asr()
+            config.require_buffer()
+            if config.buffer.enabled:
+                from .buffer import BufferClient
+
+                async with aiohttp.ClientSession(
+                    trust_env=True, timeout=aiohttp.ClientTimeout(total=60)
+                ) as session:
+                    await BufferClient(session).verify_channels(config.buffer)
         if args.tools:
             binaries = ["ffmpeg", "ffprobe", "deno"]
             if config.asr.provider == "local":
@@ -149,7 +170,55 @@ async def async_main(args, config):
         print(json.dumps(policies(config.s3), ensure_ascii=False, indent=2))
         return 0
     db = Database(config.paths.database)
-    if args.command == "queue":
+    if args.command == "buffer-accounts":
+        import os
+
+        from .buffer import BufferClient
+
+        if not os.getenv("BUFFER_API_KEY", "").strip():
+            raise ValueError("Brak BUFFER_API_KEY w otoczeniu procesu.")
+        async with aiohttp.ClientSession(
+            trust_env=True, timeout=aiohttp.ClientTimeout(total=60)
+        ) as session:
+            client = BufferClient(session)
+            organizations = await client.organizations()
+            for organization in organizations:
+                organization["channels"] = await client.channels(organization["id"])
+            print(json.dumps(organizations, ensure_ascii=False, indent=2))
+    elif args.command == "buffer-queue":
+        from .buffer_store import BufferStore
+
+        store = BufferStore(db)
+        print(
+            json.dumps(
+                [
+                    {
+                        "job_id": p["job_id"],
+                        "chapter": p["chapter_index"] + 1,
+                        "due_at": p["due_at"],
+                        "variant": p["variant"],
+                        "deliveries": [
+                            {k: d[k] for k in ("channel_id", "status", "post_id", "detail")}
+                            for d in store.deliveries(p["job_id"], p["chapter_index"])
+                        ],
+                    }
+                    for p in store.plans()
+                ],
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+    elif args.command == "buffer-retry":
+        from .buffer_store import BufferStore
+
+        BufferStore(db).retry(
+            args.id,
+            args.chapter - 1,
+            args.channel_id,
+            confirmed_not_created=args.confirmed_not_created,
+        )
+        print("Wysyłka do Buffera dodana ponownie do kolejki.")
+    elif args.command == "queue":
         print(json.dumps(db.list_jobs(), ensure_ascii=False, indent=2))
     elif args.command == "job":
         job = db.get(args.id)

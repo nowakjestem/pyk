@@ -11,6 +11,7 @@ from urllib.parse import urlsplit, urlunsplit
 import aiohttp
 from aiohttp import web
 
+from .buffer_store import BufferStore
 from .config import Config
 from .db import Database
 from .errors import PermanentError, TransientError
@@ -69,6 +70,68 @@ class Bot:
         self.connected = False
         self.last_reconcile = 0.0
         self.users = {}
+
+    async def handle_reaction(self, reaction: dict):
+        if not self.config.buffer.enabled or not isinstance(reaction, dict):
+            return
+        post_id, user_id = reaction.get("post_id"), reaction.get("user_id")
+        if not post_id or not user_id or user_id == self.own_id:
+            return
+        store = BufferStore(self.db)
+        # Trust only persisted Pyk chapter posts in channels this bot currently watches.
+        with self.db.connect() as db:
+            row = db.execute(
+                "SELECT channel_id FROM outbox WHERE post_id=? AND event_key GLOB 'chapter:[0-9]*' AND status='sent'",
+                (post_id,),
+            ).fetchone()
+        if not row or row["channel_id"] not in self.config.mattermost.channel_ids:
+            return
+        if user_id not in self.users:
+            try:
+                user = await self.client.get(f"/users/{user_id}")
+            except PermanentError:
+                return
+            if len(self.users) >= 1000:
+                self.users.pop(next(iter(self.users)))
+            self.users[user_id] = bool(user.get("is_bot"))
+        if not self.users[user_id]:
+            store.accept(post_id, reaction.get("emoji_name"), user_id)
+
+    async def reconcile_reactions(self):
+        if not self.config.buffer.enabled:
+            return
+        store = BufferStore(self.db)
+        for plan in store.plans(accepted=False):
+            if plan["mattermost_channel"] not in self.config.mattermost.channel_ids:
+                continue
+            result = (
+                json.loads(plan["checkpoint"])
+                .get("results", {})
+                .get(str(plan["chapter_index"]), {})
+            )
+            if not any(
+                v.get("expires_at", 0) > time.time() for v in result.get("variants", {}).values()
+            ):
+                continue
+            post = self.db.notification_for_event(
+                plan["job_id"], f"chapter:{plan['chapter_index']}"
+            )
+            if not post or post["status"] != "sent":
+                continue
+            try:
+                reactions = await self.client.get(f"/posts/{post['post_id']}/reactions")
+            except PermanentError:
+                log.warning("Buffer reaction post is no longer accessible")
+                continue
+            for reaction in sorted(
+                reactions or [],
+                key=lambda r: (
+                    r.get("create_at", 0),
+                    r.get("user_id", ""),
+                    r.get("emoji_name", ""),
+                ),
+            ):
+                await self.handle_reaction(reaction)
 
     async def handle_post(self, post: dict):
         if post.get("channel_id") not in self.config.mattermost.channel_ids:
@@ -154,6 +217,7 @@ class Bot:
             try:
                 for channel_id in self.config.mattermost.channel_ids:
                     await self.reconcile_channel(channel_id)
+                await self.reconcile_reactions()
                 self.last_reconcile = time.monotonic()
             except TransientError:
                 log.warning("mattermost reconciliation temporarily unavailable")
@@ -183,7 +247,15 @@ class Bot:
                 await self.client.request(
                     "PUT",
                     f"/posts/{original['post_id']}/patch",
-                    json={"message": notification["message"]},
+                    json={
+                        "message": (
+                            BufferStore(self.db).message(
+                                notification["job_id"], int(notification["event_key"].split(":")[1])
+                            )
+                            if notification["event_key"].startswith("buffer:")
+                            else notification["message"]
+                        )
+                    },
                 )
                 self.db.notification_sent(notification["id"], original["post_id"])
                 return
@@ -233,6 +305,11 @@ class Bot:
                                 await self.handle_post(
                                     json.loads(post) if isinstance(post, str) else post
                                 )
+                            elif event.get("event") == "reaction_added":
+                                reaction = event.get("data", {}).get("reaction")
+                                await self.handle_reaction(
+                                    json.loads(reaction) if isinstance(reaction, str) else reaction
+                                )
                         elif message.type in (aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSED):
                             break
             except (
@@ -271,6 +348,7 @@ class Bot:
 
 async def run_bot(config: Config):
     config.require_integrations()
+    config.require_buffer()
     db = Database(config.paths.database)
     timeout = aiohttp.ClientTimeout(total=60, connect=15)
     async with aiohttp.ClientSession(
@@ -294,5 +372,9 @@ async def run_bot(config: Config):
                 group.create_task(bot.websocket_loop())
                 group.create_task(bot.reconcile_loop())
                 group.create_task(bot.outbox_loop())
+                if config.buffer.enabled:
+                    from .buffer_publisher import run_publisher
+
+                    group.create_task(run_publisher(config, db))
         finally:
             await runner.cleanup()

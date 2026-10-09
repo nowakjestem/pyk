@@ -9,6 +9,48 @@ from rolki.subtitles import Cue, Word
 from rolki.worker import execute
 
 
+async def test_buffer_plan_before_render_and_retention(
+    db, config, enqueue, fake_media, monkeypatch
+):
+    from rolki.buffer_store import BufferStore
+    from rolki.config import Buffer
+
+    config = config.model_copy(
+        update={
+            "buffer": Buffer(
+                enabled=True,
+                organization_id="org",
+                channels=[{"id": "ig", "platform": "instagram"}],
+            )
+        }
+    )
+    monkeypatch.setenv("BUFFER_API_KEY", "test-key")
+    calls, _storage = fake_media
+
+    class Client:
+        def __init__(self, _session):
+            pass
+
+        async def verify_channels(self, _settings):
+            assert calls["metadata"] == 1
+            assert calls["download"] == 0
+
+        async def posts(self, _settings):
+            return []
+
+    monkeypatch.setattr("rolki.buffer_publisher.BufferClient", Client)
+    job_id = enqueue(config=config)
+    await execute(db, Pipeline(db), db.claim())
+    assert db.get(job_id)["status"] == "done"
+    store = BufferStore(db)
+    assert len(store.plans()) == 2
+    assert all(not p["variant"] for p in store.plans())
+    assert "scissors" in db.notification_for_event(job_id, "chapter:0")["message"]
+    result = json.loads(db.get(job_id)["checkpoint"])["results"]["0"]
+    assert result["variants"]["crop"]["expires_at"] > store.plan(job_id, 0)["due_at"]
+    assert not store.deliveries(job_id, 0)
+
+
 @pytest.fixture
 def fake_media(monkeypatch):
     from rolki import pipeline

@@ -10,6 +10,12 @@ Python 3.12, SQLite, yt-dlp + Deno/EJS, bezpośrednie API OpenAI, FFmpeg/libass 
 Lokalny whisper.cpp pozostaje opcjonalnym backendem i obsługuje starsze zadania.
 Bez Redis, Celery, publicznego webhooka i panelu administracyjnego.
 
+Opcjonalna [integracja z Buffer](docs/buffer.md) pozwala zatwierdzić rozdział reakcją
+✂️ (crop) lub 🖼️ (letterbox) na wiadomości z linkami. Każdy członek kanału może
+zatwierdzać. Pyk wyznacza rozłożone w czasie terminy na następny tydzień i po reakcji
+zleca automatyczne publikacje na skonfigurowanych kontach Instagram, TikTok i YouTube.
+Integracja jest domyślnie wyłączona; wymaga klucza API Buffera i podłączenia kont.
+
 ## Uruchomienie na VPS
 
 Repozytorium i wszystkie obrazy buduj w osobnym katalogu, np. `/home/nowak/mattermost-rolki`.

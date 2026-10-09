@@ -4,9 +4,11 @@ import hashlib
 import json
 import os
 import re
+from datetime import time
 from pathlib import Path
 from typing import Literal
 from urllib.parse import urlsplit
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import yaml
 from dotenv import load_dotenv
@@ -207,6 +209,61 @@ class Worker(Settings):
     shutdown_grace_seconds: int = Field(default=30, ge=1)
 
 
+class BufferSchedule(Settings):
+    timezone: str = "Europe/Warsaw"
+    window_start: time = time(10)
+    window_end: time = time(20)
+    min_gap_minutes: int = Field(default=180, ge=1, le=1440)
+    max_posts_per_day: int = Field(default=2, ge=1, le=24)
+    min_lead_minutes: int = Field(default=120, ge=5)
+
+    @model_validator(mode="after")
+    def valid_window(self):
+        try:
+            ZoneInfo(self.timezone)
+        except ZoneInfoNotFoundError as exc:
+            raise ValueError("invalid Buffer timezone") from exc
+        if self.window_start >= self.window_end:
+            raise ValueError("Buffer window must start before it ends on the same day")
+        if any(t.tzinfo or t.second or t.microsecond for t in (self.window_start, self.window_end)):
+            raise ValueError("Buffer window must use local hours and minutes")
+        return self
+
+
+class BufferChannel(Settings):
+    id: str = Field(min_length=1)
+    platform: Literal["instagram", "tiktok", "youtube"]
+    max_video_seconds: int = Field(default=180, ge=1)
+    max_text_chars: int = Field(default=2000, ge=1)
+    should_share_to_feed: bool = True
+    category_id: str = "22"
+    privacy: Literal["public", "private", "unlisted"] = "public"
+    made_for_kids: bool = False
+
+
+class Buffer(Settings):
+    enabled: bool = False
+    organization_id: str = ""
+    reactions: dict[str, Literal["crop", "letterbox"]] = Field(
+        default_factory=lambda: {"scissors": "crop", "frame_with_picture": "letterbox"}
+    )
+    channels: list[BufferChannel] = Field(default_factory=list)
+    schedule: BufferSchedule = Field(default_factory=BufferSchedule)
+    retention_margin_hours: int = Field(default=72, ge=1)
+    poll_seconds: int = Field(default=30, ge=5)
+    status_poll_seconds: int = Field(default=3600, ge=300)
+
+    @model_validator(mode="after")
+    def valid_buffer(self):
+        if len({c.id for c in self.channels}) != len(self.channels):
+            raise ValueError("duplicate Buffer channel")
+        if not self.reactions or any(not re.fullmatch(r"[a-z0-9_+-]+", e) for e in self.reactions):
+            raise ValueError("invalid Buffer reaction names")
+        if self.enabled and not (self.organization_id and self.channels):
+            raise ValueError("Buffer requires organization_id and channels")
+        return self
+
+
 class Config(Settings):
     mattermost: Mattermost = Field(default_factory=Mattermost)
     paths: Paths = Field(default_factory=Paths)
@@ -217,6 +274,7 @@ class Config(Settings):
     s3: S3 = Field(default_factory=S3)
     limits: Limits = Field(default_factory=Limits)
     worker: Worker = Field(default_factory=Worker)
+    buffer: Buffer = Field(default_factory=Buffer)
 
     @model_validator(mode="after")
     def margins(self):
@@ -249,6 +307,10 @@ class Config(Settings):
             "OPENAI_API_KEY", ""
         ).strip():
             raise ValueError("Brak OPENAI_API_KEY w .env.")
+
+    def require_buffer(self):
+        if self.buffer.enabled and not os.getenv("BUFFER_API_KEY", "").strip():
+            raise ValueError("Brak BUFFER_API_KEY w otoczeniu procesu.")
 
 
 def validate_url(value: str) -> str:

@@ -5,6 +5,12 @@ mattermost:
   reconcile_seconds: 60
   health_port: 8089
 
+# Optional: see docs/buffer.md. Anyone in a watched Mattermost channel may approve.
+buffer:
+  enabled: false
+  organization_id: ''
+  channels: []
+
 paths:
   database: data/state.sqlite3
   work_dir: data/work

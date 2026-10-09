@@ -86,6 +86,7 @@ async def execute(db: Database, pipeline: Pipeline, job: dict):
 async def run_worker(config: Config):
     config.require_storage()
     config.require_asr()
+    config.require_buffer()
     db = Database(config.paths.database)
     with worker_lock(db):
         db.recover()

@@ -5,6 +5,7 @@ import json
 import logging
 import shutil
 import sys
+import time
 from dataclasses import asdict
 from pathlib import Path
 
@@ -76,6 +77,12 @@ class Pipeline:
             state["results"] = {}
             save("metadata_done")
 
+        from .buffer_publisher import reserve_plan
+        from .buffer_store import BufferStore
+
+        await reserve_plan(self.db, job, state["chapters"], config)
+        buffer_store = BufferStore(self.db)
+
         self.db.notify(
             job["id"],
             "metadata",
@@ -138,23 +145,36 @@ class Pipeline:
                             f"{config.s3.prefix}/{job['id']}/{chapter['index']:03}/{filename}"
                         )
                     key = keys[variant]
+                    upload_started = result.setdefault("upload_started_at", {}).setdefault(
+                        variant, time.time()
+                    )
                     save(f"uploading:{index}:{variant}")  # Persist names before external I/O.
                     url = await retry_network(
                         lambda output=output, key=key: storage.upload(output, key)
                     )
-                    result["variants"][variant] = {"key": key, "url": url}
+                    result["variants"][variant] = {
+                        "key": key,
+                        "url": url,
+                        "expires_at": upload_started + config.s3.retention_days * 86400,
+                    }
                     save(f"uploaded:{index}:{variant}")
                     output.unlink(missing_ok=True)
 
             variants = result["variants"]
             title = safe_markdown(chapter["title"])
-            self.db.notify(
-                job["id"],
-                f"chapter:{index}",
+            chapter_message = (
                 f"**{chapter['index'] + 1}. {title}**\n\n"
                 f"[9:16 — wycięty kadr]({variants['crop']['url']}) · "
                 f"[9:16 — pełny obraz z pasami]({variants['letterbox']['url']})\n\n"
-                f"Pliki są przechowywane przez {config.s3.retention_days} dni.",
+                f"Pliki są przechowywane przez {config.s3.retention_days} dni."
+            )
+            if buffer_store.plan(job["id"], chapter["index"]):
+                buffer_store.base_message(job["id"], chapter["index"], chapter_message)
+                chapter_message = buffer_store.message(job["id"], chapter["index"])
+            self.db.notify(
+                job["id"],
+                f"chapter:{index}",
+                chapter_message,
                 after_event=previous_description,
             )
             if config.descriptions.enabled:

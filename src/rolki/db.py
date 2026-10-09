@@ -30,7 +30,7 @@ CREATE TABLE IF NOT EXISTS outbox (
 );
 CREATE TABLE IF NOT EXISTS cursors (channel_id TEXT PRIMARY KEY, since_ms INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS runtime (name TEXT PRIMARY KEY, heartbeat REAL NOT NULL, detail TEXT NOT NULL);
-PRAGMA user_version=4;
+PRAGMA user_version=5;
 """
 
 
@@ -48,6 +48,10 @@ class Database:
                 db.execute("ALTER TABLE outbox ADD COLUMN update_of TEXT")
             if "after_event" not in {row[1] for row in db.execute("PRAGMA table_info(outbox)")}:
                 db.execute("ALTER TABLE outbox ADD COLUMN after_event TEXT")
+            from .buffer_store import SCHEMA as BUFFER_SCHEMA
+
+            # Additive tables leave existing jobs and notifications unchanged.
+            db.executescript(BUFFER_SCHEMA)
 
     @contextmanager
     def connect(self, immediate=False):
