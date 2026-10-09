@@ -71,6 +71,41 @@ class Bot:
         self.last_reconcile = 0.0
         self.users = {}
 
+    async def seed_choice_reactions(self, notification, post_id, reactions=None):
+        if (
+            not self.config.buffer.enabled
+            or notification["channel_id"] not in self.config.mattermost.channel_ids
+        ):
+            return
+        event = notification["event_key"].split(":")
+        if len(event) != 2 or event[0] != "chapter" or not event[1].isdigit():
+            return
+        if not BufferStore(self.db).plan(notification["job_id"], int(event[1])):
+            return
+        settings = Config.model_validate_json(
+            self.db.get(notification["job_id"])["config_json"]
+        ).buffer
+        if not settings.enabled:
+            return
+        try:
+            if reactions is None:
+                reactions = await self.client.get(f"/posts/{post_id}/reactions")
+            present = {
+                r.get("emoji_name") for r in reactions or [] if r.get("user_id") == self.own_id
+            }
+            for emoji in settings.reactions:
+                if emoji in present:
+                    continue
+                await self.client.request(
+                    "POST",
+                    "/reactions",
+                    json={"user_id": self.own_id, "post_id": post_id, "emoji_name": emoji},
+                )
+        except (TransientError, PermanentError) as exc:
+            # The message is already delivered. Reconciliation repairs missing
+            # reactions without resending the post or blocking human approval.
+            log.warning("Buffer choice reactions failure_type=%s", type(exc).__name__)
+
     async def handle_reaction(self, reaction: dict):
         if not self.config.buffer.enabled or not isinstance(reaction, dict):
             return
@@ -136,6 +171,7 @@ class Bot:
                 ),
             ):
                 await self.handle_reaction(reaction)
+            await self.seed_choice_reactions(post, post["post_id"], reactions)
 
     async def handle_post(self, post: dict):
         if post.get("channel_id") not in self.config.mattermost.channel_ids:
@@ -270,6 +306,7 @@ class Bot:
                 for post in thread.get("posts", {}).values():
                     if post.get("props", {}).get("rolki_event") == notification["id"]:
                         self.db.notification_sent(notification["id"], post["id"])
+                        await self.seed_choice_reactions(notification, post["id"])
                         return
             result = await self.client.request(
                 "POST",
@@ -282,6 +319,7 @@ class Bot:
                 },
             )
             self.db.notification_sent(notification["id"], result["id"])
+            await self.seed_choice_reactions(notification, result["id"], [])
         except (TransientError, PermanentError) as exc:
             self.db.notification_failed(notification["id"], isinstance(exc, PermanentError))
             log.warning("notification=%s failure_type=%s", notification["id"], type(exc).__name__)

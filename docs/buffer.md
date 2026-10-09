@@ -9,6 +9,12 @@ Na wiadomości z dwoma linkami dodaj:
 - `:scissors:` — publikacja wariantu crop;
 - `:frame_with_picture:` — publikacja wariantu letterbox.
 
+Bot dodaje obie reakcje do wiadomości z linkami, aby wystarczyło kliknąć gotowe emoji.
+Reakcje bota nie zatwierdzają publikacji: dopiero dodatkowa reakcja użytkownika
+wybiera wariant. Używane są emoji ze snapshotu konfiguracji danego zadania.
+Po restarcie lub błędzie dodawania reakcji bot uzupełnia brakujące reakcje na
+niezatwierdzonych wiadomościach z nadal dostępnymi klipami, bez ponownej wysyłki wiadomości.
+
 Każdy członek skonfigurowanego kanału Mattermosta może zatwierdzać; nie ma whitelisty.
 Reakcje botów są ignorowane. Pierwsza poprawna reakcja ustala jeden wariant rozdziału
 dla wszystkich kont docelowych. Kolejne reakcje nie tworzą kolejnych publikacji.

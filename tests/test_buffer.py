@@ -643,6 +643,143 @@ class MattermostFake:
         return {}
 
 
+@pytest.mark.parametrize("failure", [None, "before", "after"])
+async def test_bot_seeds_two_reactions_and_only_human_click_schedules(
+    db, queue_config, monkeypatch, failure
+):
+    job_id = prepare(db, queue_config, approve=False)
+    store = BufferStore(db)
+    notification = db.notification_for_event(job_id, "chapter:0")
+    with db.connect() as connection:
+        connection.execute(
+            "UPDATE outbox SET status='pending',post_id=NULL WHERE id=?", (notification["id"],)
+        )
+    notification = db.notification_for_event(job_id, "chapter:0")
+    post_id = f"clip-{job_id}-0"
+    reactions, reaction_calls, posts = [], [], []
+    failed = False
+
+    async def create_post(request):
+        posts.append(await request.json())
+        return web.json_response({"id": post_id})
+
+    async def add_reaction(request):
+        nonlocal failed
+        reaction = await request.json()
+        reaction_calls.append(reaction)
+        fail = failure and reaction["emoji_name"] == "frame_with_picture" and not failed
+        if fail:
+            failed = True
+        if not fail or failure == "after":
+            assert not any(
+                r["user_id"] == reaction["user_id"] and r["emoji_name"] == reaction["emoji_name"]
+                for r in reactions
+            )
+            reactions.append(reaction)
+            await bot.handle_reaction(reaction)
+        return web.Response(status=503) if fail else web.json_response(reaction)
+
+    async def get_reactions(_request):
+        return web.json_response(reactions)
+
+    async def get_user(request):
+        return web.json_response({"is_bot": request.match_info["user_id"] == "other-bot"})
+
+    app = web.Application()
+    app.router.add_post("/api/v4/posts", create_post)
+    app.router.add_post("/api/v4/reactions", add_reaction)
+    app.router.add_get("/api/v4/posts/{post_id}/reactions", get_reactions)
+    app.router.add_get("/api/v4/users/{user_id}", get_user)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 0)
+    await site.start()
+    port = site._server.sockets[0].getsockname()[1]
+    try:
+        async with aiohttp.ClientSession() as session:
+            client = MattermostClient(session, f"http://127.0.0.1:{port}")
+            # Existing jobs use their own emoji configuration, even if YAML changed.
+            current = queue_config.model_copy(
+                update={
+                    "buffer": queue_config.buffer.model_copy(
+                        update={"reactions": {"thumbsup": "crop"}}
+                    )
+                }
+            )
+            bot = Bot(current, db, client, "own-bot")
+            await bot.deliver_notification(notification)
+            assert db.notification_for_event(job_id, "chapter:0")["status"] == "sent"
+            assert len(posts) == 1
+            assert [r["emoji_name"] for r in reaction_calls] == ["scissors", "frame_with_picture"]
+            assert all(
+                r["user_id"] == "own-bot" and r["post_id"] == post_id for r in reaction_calls
+            )
+            assert not store.plan(job_id, 0)["variant"] and not store.deliveries(job_id, 0)
+            p, buffer_client = publisher(db, monkeypatch)
+            await p.tick(now=NOW.timestamp())
+            assert not buffer_client.created
+            # Restart repairs missing reactions; an ambiguous successful POST is not repeated.
+            bot = Bot(current, db, client, "own-bot")
+            await bot.reconcile_reactions()
+            await bot.reconcile_reactions()
+            assert len(posts) == 1 and len(reactions) == 2
+            assert len(reaction_calls) == (3 if failure == "before" else 2)
+            assert not store.plan(job_id, 0)["variant"]
+            await bot.handle_reaction(
+                {"post_id": post_id, "user_id": "other-bot", "emoji_name": "scissors"}
+            )
+            assert not store.plan(job_id, 0)["variant"]
+            await client.request(
+                "POST",
+                "/reactions",
+                json={"user_id": "member", "post_id": post_id, "emoji_name": "frame_with_picture"},
+            )
+            assert len(reactions) == 3
+            assert store.plan(job_id, 0)["variant"] == "letterbox"
+            await p.tick(now=NOW.timestamp())
+            assert len(buffer_client.created) == 3
+            assert all(
+                r["assets"][0]["video"]["url"].endswith("letterbox.mp4")
+                for r in buffer_client.created
+            )
+    finally:
+        await runner.cleanup()
+
+
+async def test_recovered_chapter_post_seeds_reactions_without_new_message(db, queue_config):
+    job_id = prepare(db, queue_config, approve=False)
+    notification = db.notification_for_event(job_id, "chapter:0")
+    post_id = notification["post_id"]
+    with db.connect() as connection:
+        connection.execute(
+            "UPDATE outbox SET status='pending',post_id=NULL,attempts=1 WHERE id=?",
+            (notification["id"],),
+        )
+    notification = db.notification_for_event(job_id, "chapter:0")
+
+    class RecoveredClient(MattermostFake):
+        async def get(self, path, **kwargs):
+            if path.endswith("/thread"):
+                return {
+                    "posts": {
+                        post_id: {"id": post_id, "props": {"rolki_event": notification["id"]}}
+                    }
+                }
+            return await super().get(path, **kwargs)
+
+        async def request(self, method, path, **kwargs):
+            assert method == "POST" and path == "/reactions"
+            self.sent.append(kwargs["json"])
+            return kwargs["json"]
+
+    client = RecoveredClient([])
+    bot = Bot(queue_config, db, client, "own-bot")
+    await bot.deliver_notification(notification)
+    assert {r["emoji_name"] for r in client.sent} == {"scissors", "frame_with_picture"}
+    assert db.notification_for_event(job_id, "chapter:0")["post_id"] == post_id
+    assert not BufferStore(db).plan(job_id, 0)["variant"]
+
+
 async def test_any_member_and_reconnect_reactions(db, buffer_config):
     job_id = prepare(db, buffer_config, approve=False)
     reaction = {
