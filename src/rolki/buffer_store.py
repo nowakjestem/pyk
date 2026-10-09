@@ -177,7 +177,7 @@ class BufferStore:
             ).strftime("%d.%m.%Y %H:%M")
             summary = f"Termin: **{due} ({settings.schedule.timezone})**."
         else:
-            summary = "Brak wolnego terminu w następnym tygodniu."
+            summary = "Brak wolnego terminu w ciągu najbliższych 7 dni."
         with self.db.connect() as db:
             deliveries = {
                 r["channel_id"]: dict(r)
@@ -218,9 +218,25 @@ class BufferStore:
             summary += "\n" + plan["notice"]
         return plan["base_message"] + "\n\n" + summary
 
-    def move(self, job_id, index, settings, external, *, now=None):
+    def move(
+        self,
+        job_id,
+        index,
+        settings,
+        external,
+        *,
+        now=None,
+        unapproved_only=False,
+        notice="Termin skorygowano po późnej akceptacji lub wykryciu kolizji.",
+    ):
         now = now or datetime.now(UTC)
         with self.db.connect(immediate=True) as db:
+            plan = db.execute(
+                "SELECT variant FROM buffer_plans WHERE job_id=? AND chapter_index=?",
+                (job_id, index),
+            ).fetchone()
+            if not plan or (unapproved_only and plan["variant"] is not None):
+                return False
             if db.execute(
                 "SELECT 1 FROM buffer_deliveries WHERE job_id=? AND chapter_index=? AND status NOT IN ('pending','failed')",
                 (job_id, index),
@@ -237,9 +253,7 @@ class BufferStore:
                 "UPDATE buffer_plans SET due_at=?,notice=? WHERE job_id=? AND chapter_index=?",
                 (
                     due,
-                    "Termin skorygowano po późnej akceptacji lub wykryciu kolizji."
-                    if due
-                    else "Brak wolnego terminu; ponów po zmianie kalendarza.",
+                    notice if due else "Brak wolnego terminu; ponów po zmianie kalendarza.",
                     job_id,
                     index,
                 ),

@@ -8,11 +8,6 @@ from zoneinfo import ZoneInfo
 from .config import BufferSchedule
 
 
-def next_week(now: datetime, zone: ZoneInfo):
-    local = now.astimezone(zone)
-    return local.date() + timedelta(days=7 - local.weekday())
-
-
 def choose_time(
     settings: BufferSchedule,
     now: datetime,
@@ -20,14 +15,16 @@ def choose_time(
     channels: list[str],
     occupied: list[tuple[str, float]],
 ) -> float | None:
-    """Choose a minute in the next full local week, respecting each target account."""
+    """Choose a daytime minute within the next 168 hours for all target accounts."""
     zone = ZoneInfo(settings.timezone)
-    monday = next_week(now, zone)
+    first_day = now.astimezone(zone).date()
+    window_end = now.timestamp() + 7 * 24 * 3600
+    last_day = datetime.fromtimestamp(window_end, zone).date()
     rng = random.Random(int.from_bytes(hashlib.sha256(seed.encode()).digest(), "big"))
     by_channel = {c: [t for cid, t in occupied if cid == c] for c in channels}
     days = []
-    for offset in range(7):
-        day = monday + timedelta(days=offset)
+    for offset in range((last_day - first_day).days + 1):
+        day = first_day + timedelta(days=offset)
         counts = [
             sum(datetime.fromtimestamp(t, zone).date() == day for t in ts)
             for ts in by_channel.values()
@@ -47,7 +44,7 @@ def choose_time(
                 tzinfo=None
             ):
                 continue
-            if timestamp < now.timestamp() + settings.min_lead_minutes * 60:
+            if not now.timestamp() + settings.min_lead_minutes * 60 <= timestamp < window_end:
                 continue
             if all(
                 abs(timestamp - t) >= settings.min_gap_minutes * 60

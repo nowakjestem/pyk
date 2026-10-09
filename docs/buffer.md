@@ -89,8 +89,9 @@ lokalnej kolejki i obsługę nowych reakcji, ale nie anuluje wpisów już przyj�
 
 ## Terminy i limity
 
-Następny tydzień oznacza następny pełny poniedziałek–niedzielę względem daty odczytu
-metadanych w wybranej strefie. Pyk równomiernie rozdziela rozdziały między dniami
+Okno publikacji trwa od chwili odczytu metadanych do +7 dni (168 godzin), również
+w poprzek zmiany czasu. Publikacja może nastąpić już dziś, jeśli pozwalają na to
+okno godzinowe i `min_lead_minutes`. Nie czekamy do poniedziałku. Pyk równomiernie rozdziela rozdziały między dniami
 i dobiera pseudolosową minutę w oknie dziennym. SQLite utrwala plan; restart go
 nie losuje ponownie. Ten sam rozdział może ukazać się jednocześnie na różnych kontach.
 
@@ -100,9 +101,19 @@ więc uwzględnia wpisy dodane ręcznie. Zmiana kalendarza po kontroli nadal mo�
 spowodować kolizję; nie ma wspólnej transakcji SQLite i Buffera.
 
 Przy braku pojemności wiadomość pokazuje brak terminu. Po późnej reakcji albo
-wykryciu kolizji Pyk szuka terminu w następnym tygodniu względem bieżącego czasu
+wykryciu kolizji Pyk szuka terminu w ciągu kolejnych 7 dni względem bieżącego czasu
 i aktualizuje wiadomość. Terminów już przyjętych na choćby jednym koncie nie
 przesuwa automatycznie; brakujące konta mogą wymagać ręcznego rozstrzygnięcia.
+
+Po aktualizacji wcześniejsze propozycje terminów można przeliczyć dla wybranego
+zadania. Polecenie dotyczy tylko rozdziałów, których nikt jeszcze nie zatwierdził,
+i aktualizuje wiadomości z linkami przez outbox bota:
+
+```sh
+docker compose run --rm --no-deps bot buffer-replan PELNY_ID_ZADANIA
+```
+
+Wpisy już zatwierdzone lub zaplanowane w Bufferze zachowują swój termin.
 
 `max_video_seconds` i `max_text_chars` to konfigurowalne ograniczenia Pyk, nie lista
 gwarancji platform. Domyślny ostrożny limit to 180 sekund i 2000 znaków. Dostosuj

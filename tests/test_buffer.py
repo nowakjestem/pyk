@@ -17,7 +17,7 @@ from rolki.config import Buffer, BufferSchedule, Config
 from rolki.db import Database
 from rolki.errors import PermanentError, TransientError
 from rolki.mattermost import Bot, MattermostClient
-from rolki.scheduling import choose_time, next_week
+from rolki.scheduling import choose_time
 
 NOW = datetime(2026, 10, 9, 12, tzinfo=UTC)
 
@@ -95,35 +95,114 @@ def test_defaults_and_validation(buffer_config):
 
 
 @pytest.mark.parametrize(
-    "now,expected",
+    "now",
     [
-        (NOW, "2026-10-12"),
-        (datetime(2026, 10, 12, tzinfo=UTC), "2026-10-19"),
-        (datetime(2026, 10, 11, 22, 30, tzinfo=UTC), "2026-10-19"),
-        (datetime(2026, 10, 23, tzinfo=UTC), "2026-10-26"),
+        NOW,
+        datetime(2026, 10, 12, tzinfo=UTC),
+        datetime(2026, 10, 11, 22, 30, tzinfo=UTC),
+        datetime(2026, 10, 23, tzinfo=UTC),
     ],
 )
-def test_local_calendar_week(now, expected):
-    assert next_week(now, ZoneInfo("Europe/Warsaw")).isoformat() == expected
+def test_rolling_window_starts_today_or_next_day(now):
+    settings = BufferSchedule()
+    due = choose_time(settings, now, "rolling", ["ig"], [])
+    local = datetime.fromtimestamp(due, ZoneInfo(settings.timezone))
+    assert now.timestamp() + settings.min_lead_minutes * 60 <= due < now.timestamp() + 7 * 86400
+    assert local.date() <= now.astimezone(ZoneInfo(settings.timezone)).date() + timedelta(days=1)
 
 
 def test_scheduler_distribution_capacity_and_determinism():
     settings = BufferSchedule()
+    start = NOW.replace(hour=0)
     occupied = []
     times = []
     for i in range(14):
-        due = choose_time(settings, NOW, str(i), ["ig", "tt"], occupied)
-        assert due == choose_time(settings, NOW, str(i), ["ig", "tt"], occupied)
+        due = choose_time(settings, start, str(i), ["ig", "tt"], occupied)
+        assert due == choose_time(settings, start, str(i), ["ig", "tt"], occupied)
         local = datetime.fromtimestamp(due, ZoneInfo(settings.timezone))
         assert 10 <= local.hour < 20
-        assert "2026-10-12" <= local.date().isoformat() <= "2026-10-18"
+        assert start.timestamp() <= due < start.timestamp() + 7 * 86400
         assert all(abs(due - previous) >= 180 * 60 for previous in times)
         times.append(due)
         occupied.extend((c, due) for c in ("ig", "tt"))
     assert (
         len({datetime.fromtimestamp(t, ZoneInfo(settings.timezone)).date() for t in times[:7]}) == 7
     )
-    assert choose_time(settings, NOW, "overflow", ["ig", "tt"], occupied) is None
+    assert choose_time(settings, start, "overflow", ["ig", "tt"], occupied) is None
+
+
+def test_partial_last_day_respects_exact_seven_day_cutoff():
+    settings = BufferSchedule()
+    zone = ZoneInfo(settings.timezone)
+    first = NOW.astimezone(zone).date()
+    occupied = [
+        (
+            "ig",
+            datetime.combine(first + timedelta(days=day), settings.window_start, zone).timestamp(),
+        )
+        for day in range(7)
+        for _ in range(settings.max_posts_per_day)
+    ]
+    due = choose_time(settings, NOW, "last-partial-day", ["ig"], occupied)
+    assert datetime.fromtimestamp(due, zone).date() == first + timedelta(days=7)
+    assert due < NOW.timestamp() + 7 * 86400
+    occupied.extend(("ig", due) for _ in range(settings.max_posts_per_day))
+    assert choose_time(settings, NOW, "full", ["ig"], occupied) is None
+
+
+def test_evening_does_not_schedule_overnight():
+    now = datetime(2026, 10, 9, 17, tzinfo=UTC)
+    due = choose_time(BufferSchedule(), now, "evening", ["ig"], [])
+    local = datetime.fromtimestamp(due, ZoneInfo("Europe/Warsaw"))
+    assert local.date().isoformat() == "2026-10-10"
+    assert 10 <= local.hour < 20
+
+
+def test_replan_only_unapproved_preserves_accepted_plan(db, buffer_config):
+    job_id = prepare(db, buffer_config, count=2, approve=False)
+    store = BufferStore(db)
+    store.accept(f"clip-{job_id}-0", "scissors", "member")
+    accepted = store.plan(job_id, 0)
+    with db.connect() as conn:
+        conn.execute(
+            "UPDATE buffer_plans SET due_at=? WHERE job_id=? AND chapter_index=1",
+            (NOW.timestamp() + 10 * 86400, job_id),
+        )
+    assert not store.move(job_id, 0, buffer_config.buffer, [], now=NOW, unapproved_only=True)
+    assert store.plan(job_id, 0) == accepted
+    assert store.move(
+        job_id, 1, buffer_config.buffer, [], now=NOW, unapproved_only=True, notice="Przeliczono"
+    )
+    assert NOW.timestamp() <= store.plan(job_id, 1)["due_at"] < NOW.timestamp() + 7 * 86400
+    assert "Przeliczono" in store.message(job_id, 1)
+
+
+async def test_replan_cli_uses_job_snapshot_and_only_unapproved(
+    db, buffer_config, config, monkeypatch, capsys
+):
+    from rolki.cli import async_main, parser
+
+    job_id = prepare(db, buffer_config, count=2, approve=False)
+    store = BufferStore(db)
+    store.accept(f"clip-{job_id}-0", "scissors", "member")
+    accepted = store.plan(job_id, 0)
+    monkeypatch.setenv("BUFFER_API_KEY", "test-key")
+
+    class Client:
+        def __init__(self, _session):
+            pass
+
+        async def verify_channels(self, settings):
+            assert settings.organization_id == "org"
+
+        async def posts(self, _settings):
+            return []
+
+    monkeypatch.setattr("rolki.buffer.BufferClient", Client)
+    assert await async_main(parser().parse_args(["buffer-replan", job_id]), config) == 0
+    assert "dla 1 niezatwierdzonych" in capsys.readouterr().out
+    assert store.plan(job_id, 0) == accepted
+    assert store.plan(job_id, 1)["notice"] == "Termin przeliczono na najbliższe 7 dni."
 
 
 def test_reaction_race_persists_one_variant(db, buffer_config):
@@ -298,11 +377,12 @@ async def test_invalid_media_not_scheduled(db, buffer_config, monkeypatch, probl
     assert all(d["status"] == "failed" for d in p.store.deliveries(job_id, 0))
 
 
-async def test_late_reaction_moves_next_week(db, buffer_config, monkeypatch):
+async def test_late_reaction_moves_within_next_seven_days(db, buffer_config, monkeypatch):
     job_id = prepare(db, buffer_config)
     p, client = publisher(db, monkeypatch)
-    await p.tick(now=datetime(2026, 10, 19, tzinfo=UTC).timestamp())
-    assert p.store.plan(job_id, 0)["due_at"] >= datetime(2026, 10, 26, tzinfo=UTC).timestamp()
+    late = datetime(2026, 10, 19, tzinfo=UTC).timestamp()
+    await p.tick(now=late)
+    assert late + 120 * 60 <= p.store.plan(job_id, 0)["due_at"] < late + 7 * 86400
     assert len(client.created) == 3
     assert "skorygowano" in p.store.message(job_id, 0)
 
@@ -505,10 +585,10 @@ async def test_new_manual_post_collision_replans(db, buffer_config, monkeypatch)
 
 
 def test_capacity_overflow_is_visible(db, buffer_config):
-    job_id = prepare(db, buffer_config, count=15, approve=False)
+    job_id = prepare(db, buffer_config, count=20, approve=False)
     store = BufferStore(db)
-    assert store.plan(job_id, 14)["due_at"] is None
-    assert "Brak wolnego terminu" in store.message(job_id, 14)
+    assert store.plan(job_id, 19)["due_at"] is None
+    assert "Brak wolnego terminu" in store.message(job_id, 19)
 
 
 def test_remote_move_changes_occupied_slot(db, buffer_config):
@@ -705,5 +785,5 @@ def test_dst_week_produces_daytime_local_times(now):
         due = choose_time(settings, now, str(i), ["ig"], occupied)
         local = datetime.fromtimestamp(due, zone)
         assert 10 <= local.hour < 20
-        assert next_week(now, zone) <= local.date() < next_week(now, zone) + timedelta(days=7)
+        assert now.timestamp() + settings.min_lead_minutes * 60 <= due < now.timestamp() + 7 * 86400
         occupied.append(("ig", due))
