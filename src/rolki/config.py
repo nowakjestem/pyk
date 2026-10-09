@@ -244,6 +244,7 @@ class BufferChannel(Settings):
 class Buffer(Settings):
     enabled: bool = False
     organization_id: str = ""
+    scheduling_mode: Literal["addToQueue", "customScheduled"] = "addToQueue"
     reactions: dict[str, Literal["crop", "letterbox"]] = Field(
         default_factory=lambda: {"scissors": "crop", "frame_with_picture": "letterbox"}
     )

@@ -30,7 +30,7 @@ CREATE TABLE IF NOT EXISTS outbox (
 );
 CREATE TABLE IF NOT EXISTS cursors (channel_id TEXT PRIMARY KEY, since_ms INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS runtime (name TEXT PRIMARY KEY, heartbeat REAL NOT NULL, detail TEXT NOT NULL);
-PRAGMA user_version=5;
+PRAGMA user_version=7;
 """
 
 
@@ -48,10 +48,40 @@ class Database:
                 db.execute("ALTER TABLE outbox ADD COLUMN update_of TEXT")
             if "after_event" not in {row[1] for row in db.execute("PRAGMA table_info(outbox)")}:
                 db.execute("ALTER TABLE outbox ADD COLUMN after_event TEXT")
+            from .buffer_store import DELIVERY_SCHEMA
             from .buffer_store import SCHEMA as BUFFER_SCHEMA
 
             # Additive tables leave existing jobs and notifications unchanged.
             db.executescript(BUFFER_SCHEMA)
+            db.execute("BEGIN IMMEDIATE")
+            columns = {row[1] for row in db.execute("PRAGMA table_info(buffer_deliveries)")}
+            if "part_index" not in columns:
+                db.execute(
+                    DELIVERY_SCHEMA.replace(
+                        "IF NOT EXISTS buffer_deliveries", "buffer_deliveries_new"
+                    )
+                )
+                common = [
+                    "job_id",
+                    "chapter_index",
+                    "channel_id",
+                    "status",
+                    "post_id",
+                    "request_json",
+                    "attempts",
+                    "retry_at",
+                    "detail",
+                    "updated_at",
+                ]
+                if "due_at" in columns:
+                    common.append("due_at")
+                names = ",".join(common)
+                db.execute(
+                    f"INSERT INTO buffer_deliveries_new ({names}) SELECT {names} FROM buffer_deliveries"
+                )
+                db.execute("DROP TABLE buffer_deliveries")
+                db.execute("ALTER TABLE buffer_deliveries_new RENAME TO buffer_deliveries")
+                db.execute("CREATE INDEX buffer_pending ON buffer_deliveries(status,retry_at)")
 
     @contextmanager
     def connect(self, immediate=False):

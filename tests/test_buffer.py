@@ -10,7 +10,7 @@ import pytest
 from aiohttp import web
 from pydantic import ValidationError
 
-from rolki.buffer import AmbiguousResult, BufferClient, post_input
+from rolki.buffer import AmbiguousResult, BufferClient, post_input, queue_fits_retention
 from rolki.buffer_publisher import BufferPublisher
 from rolki.buffer_store import BufferStore
 from rolki.config import Buffer, BufferSchedule, Config
@@ -28,6 +28,7 @@ def buffer_config(config):
     data["buffer"] = {
         "enabled": True,
         "organization_id": "org",
+        "scheduling_mode": "customScheduled",
         "channels": [
             {"id": "ig", "platform": "instagram"},
             {"id": "tt", "platform": "tiktok"},
@@ -35,6 +36,13 @@ def buffer_config(config):
         ],
     }
     return Config.model_validate(data)
+
+
+@pytest.fixture
+def queue_config(buffer_config):
+    return buffer_config.model_copy(
+        update={"buffer": buffer_config.buffer.model_copy(update={"scheduling_mode": "addToQueue"})}
+    )
 
 
 def prepare(db, config, *, post="source", count=1, approve=True):
@@ -244,9 +252,23 @@ class FakeClient:
     def __init__(self):
         self.created, self.remote = [], []
         self.failure = None
+        self.queue_times = {
+            c: NOW.timestamp() + (10 + i) * 86400 for i, c in enumerate(("ig", "tt", "yt"))
+        }
+        self.accounts = {
+            c: {
+                "id": c,
+                "timezone": "Europe/Warsaw",
+                "postingSchedule": [
+                    {"day": day, "paused": False, "times": ["12:00", "18:00"]}
+                    for day in ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
+                ],
+            }
+            for c in ("ig", "tt", "yt")
+        }
 
     async def verify_channels(self, _settings):
-        pass
+        return self.accounts
 
     async def posts(self, _settings):
         return [dict(p) for p in self.remote]
@@ -261,12 +283,14 @@ class FakeClient:
             "id": f"remote-{len(self.created)}",
             "channelId": request["channelId"],
             "text": request["text"],
-            "dueAt": request["dueAt"],
+            "dueAt": request.get("dueAt")
+            or datetime.fromtimestamp(self.queue_times[request["channelId"]], UTC).isoformat(),
             "status": "scheduled",
             "schedulingType": "automatic",
             "assets": [{"source": request["assets"][0]["video"]["url"]}],
         }
         self.remote.append(p)
+        self.queue_times[request["channelId"]] += 86400
         return p
 
 
@@ -294,6 +318,221 @@ async def test_three_platforms_restart_and_variant(db, buffer_config, monkeypatc
     assert all(d["status"] == "scheduled" for d in store.deliveries(job_id, 0))
     await BufferPublisher(db, client).tick(now=NOW.timestamp() + 30)
     assert len(client.created) == 3
+
+
+async def test_native_queue_uses_actual_different_dates_beyond_seven_days(
+    db, queue_config, monkeypatch
+):
+    job_id = prepare(db, queue_config, approve=False)
+    store = BufferStore(db)
+    assert store.plan(job_id, 0)["due_at"] is None
+    assert "Termin wybierze Buffer" in store.message(job_id, 0)
+    store.accept(f"clip-{job_id}-0", "frame_with_picture", "member")
+    p, client = publisher(db, monkeypatch)
+    await p.tick(now=NOW.timestamp())
+    assert len(client.created) == 3
+    assert all(r["mode"] == "addToQueue" and "dueAt" not in r for r in client.created)
+    dates = {d["due_at"] for d in store.deliveries(job_id, 0)}
+    assert len(dates) == 3
+    assert min(dates) > NOW.timestamp() + 7 * 86400
+    assert "19.10.2026" in store.message(job_id, 0)
+    await p.tick(now=NOW.timestamp() + 30)
+    assert len(client.created) == 3
+    client.remote[0]["dueAt"] = datetime.fromtimestamp(
+        NOW.timestamp() + 16 * 86400, UTC
+    ).isoformat()
+    await p.tick(now=NOW.timestamp() + 4000)
+    assert store.deliveries(job_id, 0)[0]["due_at"] == NOW.timestamp() + 16 * 86400
+    assert "25.10.2026" in store.message(job_id, 0)
+    assert len(client.created) == 3
+
+
+@pytest.mark.parametrize("problem", ["empty", "paused", "tail", "expired"])
+async def test_native_queue_retention_and_empty_schedule_do_not_create(
+    db, queue_config, monkeypatch, problem
+):
+    job_id = prepare(db, queue_config)
+    p, client = publisher(db, monkeypatch)
+    if problem == "expired":
+        state = json.loads(db.get(job_id)["checkpoint"])
+        state["results"]["0"]["variants"]["crop"]["expires_at"] = NOW.timestamp() + 3600
+        db.checkpoint(job_id, "uploaded", state)
+    for channel in client.accounts.values():
+        if problem == "empty":
+            channel["postingSchedule"] = []
+        elif problem == "paused":
+            for day in channel["postingSchedule"]:
+                day["paused"] = True
+        elif problem == "tail":
+            client.remote.append(
+                {
+                    "id": "tail-" + channel["id"],
+                    "channelId": channel["id"],
+                    "status": "scheduled",
+                    "dueAt": (NOW + timedelta(days=40)).isoformat(),
+                }
+            )
+    await p.tick(now=NOW.timestamp())
+    assert not client.created
+    assert all(d["status"] == "failed" for d in p.store.deliveries(job_id, 0))
+
+
+def test_retention_uses_channel_timezone_and_dst():
+    channel = {
+        "id": "ig",
+        "timezone": "Europe/Warsaw",
+        "postingSchedule": [{"day": "sun", "paused": False, "times": ["02:30"]}],
+    }
+    now = datetime(2026, 3, 28, 23, tzinfo=UTC).timestamp()
+    # 02:30 does not exist on the March transition Sunday.
+    assert not queue_fits_retention(channel, [], now=now, deadline=now + 86400)
+    now = datetime(2026, 10, 25, 0, 40, tzinfo=UTC).timestamp()
+    # The second 02:30 on the autumn transition is still available.
+    assert queue_fits_retention(channel, [], now=now, deadline=now + 3600)
+
+
+async def test_queue_retention_warning_after_actual_date_or_manual_move(
+    db, queue_config, monkeypatch
+):
+    job_id = prepare(db, queue_config)
+    p, client = publisher(db, monkeypatch)
+    client.queue_times["ig"] = NOW.timestamp() + 40 * 86400
+    await p.tick(now=NOW.timestamp())
+    delivery = p.store.deliveries(job_id, 0)[0]
+    assert delivery["post_id"] and delivery["status"] == "scheduled"
+    assert "przekracza retencję" in delivery["detail"]
+    with pytest.raises(ValueError):
+        p.store.retry(job_id, 0, "ig")
+    await p.tick(now=NOW.timestamp() + 4000)
+    assert len(client.created) == 3
+
+
+def add_parts(db, job_id):
+    state = json.loads(db.get(job_id)["checkpoint"])
+    result = state["results"]["0"]
+    state["chapters"][0]["end"] = 300
+    result["parts"] = [
+        {
+            "number": n,
+            "start": (n - 1) * 150,
+            "end": n * 150,
+            "cues": [{"start": 0, "end": 1, "text": "Tekst"}],
+            "variants": {
+                variant: {**media, "url": media["url"].replace(".mp4", f"-part-{n}.mp4")}
+                for variant, media in result["variants"].items()
+            },
+        }
+        for n in (1, 2)
+    ]
+    result["variants"] = {}
+    db.checkpoint(job_id, "uploaded", state)
+
+
+async def test_one_reaction_queues_all_parts_in_order(db, queue_config, monkeypatch):
+    job_id = prepare(db, queue_config, approve=False)
+    add_parts(db, job_id)
+    store = BufferStore(db)
+    assert store.accept(f"clip-{job_id}-0", "scissors", "member")
+    assert len(store.deliveries(job_id, 0)) == 6
+    p, client = publisher(db, monkeypatch)
+    await p.tick(now=NOW.timestamp())
+    assert len(client.created) == 6
+    assert all(r["mode"] == "addToQueue" and "dueAt" not in r for r in client.created)
+    for channel in ("ig", "tt", "yt"):
+        requests = [r for r in client.created if r["channelId"] == channel]
+        assert [r["text"].splitlines()[-1] for r in requests] == ["part 1 / 2", "part 2 / 2"]
+        assert requests[0]["assets"][0]["video"]["url"].endswith("crop-part-1.mp4")
+        deliveries = [d for d in store.deliveries(job_id, 0) if d["channel_id"] == channel]
+        assert deliveries[0]["due_at"] < deliveries[1]["due_at"]
+    assert "part 2 — youtube: zaplanowano" in store.message(job_id, 0)
+    await p.tick(now=NOW.timestamp() + 4000)
+    assert len(client.created) == 6
+
+
+@pytest.mark.parametrize("ambiguous", [False, True])
+async def test_first_part_failure_blocks_later_only_on_that_account(
+    db, queue_config, monkeypatch, ambiguous
+):
+    job_id = prepare(db, queue_config, approve=False)
+    add_parts(db, job_id)
+    store = BufferStore(db)
+    store.accept(f"clip-{job_id}-0", "scissors", "member")
+    p, client = publisher(db, monkeypatch)
+    client.failure = lambda r: (
+        (AmbiguousResult("unknown") if ambiguous else PermanentError("failed"))
+        if r["channelId"] == "tt"
+        else None
+    )
+    await p.tick(now=NOW.timestamp())
+    assert len(client.created) == 5
+    assert [d["status"] for d in store.deliveries(job_id, 0) if d["channel_id"] == "tt"] == [
+        "unknown" if ambiguous else "failed",
+        "pending",
+    ]
+    assert all(
+        d["status"] == "scheduled" for d in store.deliveries(job_id, 0) if d["channel_id"] != "tt"
+    )
+    await p.tick(now=NOW.timestamp() + 4000)
+    assert len(client.created) == 5
+    store.retry(job_id, 0, "tt", confirmed_not_created=ambiguous)
+    client.failure = None
+    await p.tick(now=NOW.timestamp() + 8000)
+    assert len(client.created) == 7
+    assert all(d["status"] == "scheduled" for d in store.deliveries(job_id, 0))
+
+
+async def test_queue_restart_reconciles_without_requested_timestamp(db, queue_config, monkeypatch):
+    job_id = prepare(db, queue_config, approve=False)
+    add_parts(db, job_id)
+    store = BufferStore(db)
+    store.accept(f"clip-{job_id}-0", "scissors", "member")
+    p, client = publisher(db, monkeypatch)
+    create = client.create
+
+    async def interrupted(request):
+        await create(request)
+        raise asyncio.CancelledError
+
+    client.create = interrupted
+    with pytest.raises(asyncio.CancelledError):
+        await p.tick(now=NOW.timestamp())
+    client.create = create
+    await p.tick(now=NOW.timestamp() + 30)
+    assert len(client.created) == 6
+    assert all(d["status"] == "scheduled" for d in store.deliveries(job_id, 0))
+
+
+def test_upgrade_v5_preserves_known_deliveries_and_refreshes_only_unused_plans(db, queue_config):
+    first = prepare(db, queue_config)
+    second = prepare(db, queue_config, post="second", approve=False)
+    request = post_input(
+        queue_config.buffer.channels[0],
+        url="https://clips.example/old.mp4",
+        text="old",
+        title="old",
+        due_at=NOW.timestamp() + 86400,
+    )
+    with db.connect() as conn:
+        conn.execute("DROP TABLE buffer_deliveries")
+        conn.execute(
+            "CREATE TABLE buffer_deliveries (job_id TEXT,chapter_index INTEGER,channel_id TEXT,status TEXT,post_id TEXT,request_json TEXT,attempts INTEGER,retry_at REAL,detail TEXT,updated_at REAL,PRIMARY KEY(job_id,chapter_index,channel_id))"
+        )
+        conn.execute(
+            "INSERT INTO buffer_deliveries VALUES(?,0,'ig','scheduled','known',?,1,0,'',0)",
+            (first, json.dumps(request)),
+        )
+        conn.execute("UPDATE buffer_plans SET due_at=?", (NOW.timestamp() + 86400,))
+        conn.execute("PRAGMA user_version=5")
+    migrated = Database(db.path)
+    store = BufferStore(migrated)
+    delivery = store.deliveries(first, 0)[0]
+    assert delivery["part_index"] == 0 and delivery["post_id"] == "known"
+    assert json.loads(delivery["request_json"]) == request
+    store.activate_queue()
+    assert store.plan(first, 0)["due_at"] is not None
+    assert store.plan(second, 0)["due_at"] is None
+    assert "zachowuje wcześniej" in store.message(first, 0)
+    assert "Termin wybierze Buffer" in store.message(second, 0)
 
 
 async def test_partial_success_only_retries_failed_account(db, buffer_config, monkeypatch):
@@ -516,21 +755,23 @@ async def test_timeout_is_ambiguous():
             await BufferClient(session, endpoint=endpoint).create({"channelId": "ig"})
 
 
-async def test_real_graphql_scheduled_request(buffer_config):
+@pytest.mark.parametrize("queued", [False, True])
+async def test_real_graphql_scheduled_request(buffer_config, queued):
     target = buffer_config.buffer.channels[0]
     payload = post_input(
         target,
         url="https://clips.example/video.mp4",
         text="Opis",
         title="Tytuł",
-        due_at=NOW.timestamp(),
+        due_at=None if queued else NOW.timestamp(),
     )
 
     async def handler(request):
         body = await request.json()
         inp = body["variables"]["input"]
         assert inp == payload
-        assert inp["mode"] == "customScheduled"
+        assert inp["mode"] == ("addToQueue" if queued else "customScheduled")
+        assert ("dueAt" not in inp) == queued
         assert inp["schedulingType"] == "automatic"
         return web.json_response(
             {

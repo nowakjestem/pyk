@@ -231,3 +231,28 @@ def test_line_background_is_visible_behind_both_lines(config, tmp_path, ffmpeg_a
     assert len(background) > 1000 and len(foreground) > 100
     assert min(p // 720 for p in background) < min(p // 720 for p in foreground)
     assert max(p // 720 for p in background) > max(p // 720 for p in foreground)
+
+
+@pytest.mark.parametrize("variant", ["crop", "letterbox"])
+def test_part_label_is_black_on_white_at_top_for_entire_clip(
+    config, tmp_path, ffmpeg_available, variant
+):
+    write_subtitles([], tmp_path, config.subtitles, config.video, part_number=2, duration=1.9)
+    pixels_by_time = []
+    for time in (0, 0.9, 1.85):
+        frame = subtitle_frame(tmp_path, variant, time)
+        width, height = config.video.width, config.video.height
+        white, black = set(), set()
+        for y in range(height // 4):
+            for x in range(width // 4, width * 3 // 4):
+                offset = (y * width + x) * 3
+                pixel = frame[offset : offset + 3]
+                if min(pixel) > 250:
+                    white.add((x, y))
+                elif max(pixel) < 5:
+                    black.add((x, y))
+        assert len(white) > 1000 and len(black) > 100
+        assert max(y for _, y in white) < height // 5
+        assert min(x for x, _ in white) < width // 2 < max(x for x, _ in white)
+        pixels_by_time.append((white, black))
+    assert pixels_by_time[0] == pixels_by_time[1] == pixels_by_time[2]

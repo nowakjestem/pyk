@@ -17,6 +17,7 @@ from .filenames import clip_filename, current_output_date
 from .media import chapters_for_source, probe, render, transcribe, validate_chapters
 from .process import retry_network, run_process
 from .resources import check_resources
+from .segments import clips, ready, split_chapter
 from .storage import LocalStorage, S3Storage
 from .subtitles import cue_from_dict, safe_markdown, write_subtitles
 
@@ -93,8 +94,7 @@ class Pipeline:
         )
 
         pending = any(
-            len(state["results"].get(str(c["index"]), {}).get("variants", {})) < 2
-            for c in state["chapters"]
+            not ready(state["results"].get(str(c["index"]), {})) for c in state["chapters"]
         )
         source = root / state.get("source", "source.mkv")
         source_info = None
@@ -119,7 +119,7 @@ class Pipeline:
             index = str(chapter["index"])
             result = state["results"].setdefault(index, {"variants": {}})
             chapter_root = root / f"chapter-{chapter['index']:03}"
-            if len(result["variants"]) < 2:
+            if not ready(result):
                 chapter_root.mkdir(parents=True, exist_ok=True)
                 if "cues" not in result:
                     save(f"transcribing:{index}")
@@ -127,46 +127,83 @@ class Pipeline:
                     result["cues"] = [asdict(cue) for cue in cues]
                     save(f"transcribed:{index}")
                 cues = [cue_from_dict(cue) for cue in result["cues"]]
-                write_subtitles(cues, chapter_root, config.subtitles, config.video)
-                for variant in ("crop", "letterbox"):
-                    if variant in result["variants"]:
-                        continue
-                    check_resources(config)
-                    save(f"rendering:{index}:{variant}")
-                    output = chapter_root / f"{variant}.mp4"
-                    if not output.is_file():
-                        output = await render(source, chapter, chapter_root, config, variant)
-                    if "output_date" not in state:
-                        state["output_date"] = current_output_date()
-                    keys = result.setdefault("upload_keys", {})
-                    if variant not in keys:
-                        filename = clip_filename(chapter["title"], variant, state["output_date"])
-                        keys[variant] = (
-                            f"{config.s3.prefix}/{job['id']}/{chapter['index']:03}/{filename}"
+                if "parts" not in result and not result["variants"]:
+                    parts = split_chapter(chapter, cues)
+                    if len(parts) > 1:
+                        result["parts"] = parts
+                        save(f"split:{index}")
+                for clip in clips(result):
+                    number = clip.get("number")
+                    clip_root = chapter_root / f"part-{number:03}" if number else chapter_root
+                    clip_root.mkdir(parents=True, exist_ok=True)
+                    section = (
+                        {
+                            **chapter,
+                            "start": chapter["start"] + clip["start"],
+                            "end": chapter["start"] + clip["end"],
+                        }
+                        if number
+                        else chapter
+                    )
+                    clip_cues = [cue_from_dict(c) for c in clip["cues"]]
+                    write_subtitles(
+                        clip_cues,
+                        clip_root,
+                        config.subtitles,
+                        config.video,
+                        part_number=number,
+                        duration=section["end"] - section["start"],
+                    )
+                    for variant in ("crop", "letterbox"):
+                        if variant in clip["variants"]:
+                            continue
+                        check_resources(config)
+                        save(f"rendering:{index}:{number or 0}:{variant}")
+                        output = clip_root / f"{variant}.mp4"
+                        if not output.is_file():
+                            output = await render(source, section, clip_root, config, variant)
+                        if "output_date" not in state:
+                            state["output_date"] = current_output_date()
+                        keys = clip.setdefault("upload_keys", {})
+                        if variant not in keys:
+                            filename = clip_filename(
+                                chapter["title"] + (f" part {number}" if number else ""),
+                                variant,
+                                state["output_date"],
+                            )
+                            part_path = f"part-{number:03}/" if number else ""
+                            keys[variant] = (
+                                f"{config.s3.prefix}/{job['id']}/{chapter['index']:03}/{part_path}{filename}"
+                            )
+                        key = keys[variant]
+                        upload_started = clip.setdefault("upload_started_at", {}).setdefault(
+                            variant, time.time()
                         )
-                    key = keys[variant]
-                    upload_started = result.setdefault("upload_started_at", {}).setdefault(
-                        variant, time.time()
-                    )
-                    save(f"uploading:{index}:{variant}")  # Persist names before external I/O.
-                    url = await retry_network(
-                        lambda output=output, key=key: storage.upload(output, key)
-                    )
-                    result["variants"][variant] = {
-                        "key": key,
-                        "url": url,
-                        "expires_at": upload_started + config.s3.retention_days * 86400,
-                    }
-                    save(f"uploaded:{index}:{variant}")
-                    output.unlink(missing_ok=True)
+                        save(f"uploading:{index}:{number or 0}:{variant}")
+                        url = await retry_network(
+                            lambda output=output, key=key: storage.upload(output, key)
+                        )
+                        clip["variants"][variant] = {
+                            "key": key,
+                            "url": url,
+                            "expires_at": upload_started + config.s3.retention_days * 86400,
+                        }
+                        save(f"uploaded:{index}:{number or 0}:{variant}")
+                        output.unlink(missing_ok=True)
 
-            variants = result["variants"]
             title = safe_markdown(chapter["title"])
+            links = []
+            for clip in clips(result):
+                variants = clip["variants"]
+                label = f"**part {clip['number']}** — " if "number" in clip else ""
+                links.append(
+                    label
+                    + f"[9:16 — wycięty kadr]({variants['crop']['url']}) · [9:16 — pełny obraz z pasami]({variants['letterbox']['url']})"
+                )
             chapter_message = (
                 f"**{chapter['index'] + 1}. {title}**\n\n"
-                f"[9:16 — wycięty kadr]({variants['crop']['url']}) · "
-                f"[9:16 — pełny obraz z pasami]({variants['letterbox']['url']})\n\n"
-                f"Pliki są przechowywane przez {config.s3.retention_days} dni."
+                + "\n\n".join(links)
+                + f"\n\nPliki są przechowywane przez {config.s3.retention_days} dni."
             )
             if buffer_store.plan(job["id"], chapter["index"]):
                 buffer_store.base_message(job["id"], chapter["index"], chapter_message)
@@ -203,7 +240,7 @@ class Pipeline:
         self.db.notify(
             job["id"],
             "complete",
-            f"Zadanie `{job['id'][:8]}` zakończone. Gotowych filmów: {len(state['chapters']) * 2}.",
+            f"Zadanie `{job['id'][:8]}` zakończone. Gotowych filmów: {sum(len(clips(r)) for r in state['results'].values()) * 2}.",
             after_event=previous_description,
         )
         shutil.rmtree(root)

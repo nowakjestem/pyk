@@ -109,8 +109,12 @@ class Bot:
                 .get("results", {})
                 .get(str(plan["chapter_index"]), {})
             )
+            from .segments import clips
+
             if not any(
-                v.get("expires_at", 0) > time.time() for v in result.get("variants", {}).values()
+                v.get("expires_at", 0) > time.time()
+                for clip in clips(result)
+                for v in clip.get("variants", {}).values()
             ):
                 continue
             post = self.db.notification_for_event(

@@ -12,9 +12,11 @@ Bez Redis, Celery, publicznego webhooka i panelu administracyjnego.
 
 Opcjonalna [integracja z Buffer](docs/buffer.md) pozwala zatwierdzić rozdział reakcją
 ✂️ (crop) lub 🖼️ (letterbox) na wiadomości z linkami. Każdy członek kanału może
-zatwierdzać. Pyk wyznacza rozłożone w czasie terminy od teraz do +7 dni i po reakcji
+zatwierdzać. Buffer wyznacza terminy z harmonogramu każdego konta po reakcji i
 zleca automatyczne publikacje na skonfigurowanych kontach Instagram, TikTok i YouTube.
 Integracja jest domyślnie wyłączona; wymaga klucza API Buffera i podłączenia kont.
+Segmenty ponad 3 minuty dzielimy na możliwie równe części do 180 sekund, z napisem
+`part 1`, `part 2` itd. Jedna reakcja zatwierdza wszystkie części wybranego wariantu.
 
 ## Uruchomienie na VPS
 

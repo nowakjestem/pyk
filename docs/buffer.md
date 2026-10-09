@@ -1,7 +1,8 @@
 # Publikacja klipów przez Buffer
 
-Pyk planuje terminy po odczytaniu listy rozdziałów i zapisuje je w SQLite przed
-renderowaniem. Terminy są propozycjami: do Buffera trafiają tylko zatwierdzone klipy.
+Pyk dodaje zatwierdzone klipy do kolejki Buffera (`mode: addToQueue`). Buffer wybiera
+wolne sloty z harmonogramu każdego konta. Terminy pojawiają się w wiadomości
+Mattermosta po zatwierdzeniu i mogą wykraczać poza najbliższe 7 dni.
 
 Na wiadomości z dwoma linkami dodaj:
 
@@ -19,6 +20,8 @@ przy kolejnej kontroli, domyślnie co godzinę.
 
 1. Podłącz konta społecznościowe w Bufferze i sprawdź, że pozwalają na automatyczną
    publikację, a nie tylko przypomnienia na telefon.
+   Ustaw dni, godziny i strefę czasową w **Posting Schedule** każdego konta.
+   To tam ustawiasz dzienne godziny i odstępy między publikacjami.
 2. W [Buffer Settings → API](https://publish.buffer.com/settings/api) utwórz klucz.
    Zapisz `BUFFER_API_KEY` w `.env` na VPS-ie albo jako sekret środowiska cloud
    przeznaczony dla `api.buffer.com`. Nie wpisuj klucza do YAML ani Git.
@@ -40,6 +43,7 @@ Zastąp sekcję `buffer` w YAML, używając rzeczywistych ID:
 buffer:
   enabled: true
   organization_id: 'ID_ORGANIZACJI'
+  scheduling_mode: addToQueue
   reactions:
     scissors: crop
     frame_with_picture: letterbox
@@ -62,11 +66,6 @@ buffer:
       made_for_kids: false
   schedule:
     timezone: Europe/Warsaw
-    window_start: '10:00'
-    window_end: '20:00'
-    min_gap_minutes: 180
-    max_posts_per_day: 2
-    min_lead_minutes: 120
   retention_margin_hours: 72
   poll_seconds: 30
   status_poll_seconds: 3600
@@ -83,37 +82,45 @@ docker compose up -d --force-recreate bot worker
 Kontrola integracji odczytuje stan kont i niczego nie publikuje. Domyślnie integracja
 jest wyłączona. Starsze zadania bez konfiguracji Buffera nie dostają harmonogramu
 ani nie uruchamiają publikacji na podstawie historycznych reakcji. Nowe zadania
-zapisują snapshot konfiguracji; zmiana YAML nie zmienia kont ani terminów tych zadań.
+zapisują snapshot konfiguracji; zmiana YAML nie zmienia kont tych zadań.
+Domyślny tryb to teraz `addToQueue`, także dla wcześniejszych snapshotów bez pola
+`scheduling_mode`. Po restarcie bota stare propozycje terminów zostają usunięte z
+nieuruchomionych planów, a wiadomości odświeżone. Już wysłane wpisy i zapisane
+żądania `customScheduled` zachowują dotychczasową obsługę, bez ponownej publikacji.
 Wyłączenie `buffer.enabled` w aktualnej konfiguracji bota zatrzymuje konsumenta
 lokalnej kolejki i obsługę nowych reakcji, ale nie anuluje wpisów już przyjętych przez Buffer.
 
 ## Terminy i limity
 
-Okno publikacji trwa od chwili odczytu metadanych do +7 dni (168 godzin), również
-w poprzek zmiany czasu. Publikacja może nastąpić już dziś, jeśli pozwalają na to
-okno godzinowe i `min_lead_minutes`. Nie czekamy do poniedziałku. Pyk równomiernie rozdziela rozdziały między dniami
-i dobiera pseudolosową minutę w oknie dziennym. SQLite utrwala plan; restart go
-nie losuje ponownie. Ten sam rozdział może ukazać się jednocześnie na różnych kontach.
+Buffer wybiera termin osobno dla każdego konta; Instagram, TikTok i YouTube mogą
+opublikować klip w różnych godzinach. Pyk nie podaje `dueAt`, nie losuje minut i nie
+rezerwuje slotów przed reakcją. `schedule.timezone` służy do wyświetlania terminów
+w Mattermoście; harmonogram i jego strefa czasowa pochodzą z Buffera. Ręczne
+przesunięcia w Bufferze są widoczne po synchronizacji.
 
-Odstępy i limity dzienne obejmują wszystkie zadania Pyk kierowane na dane konto.
-Pyk odczytuje również kalendarz Buffera podczas tworzenia planu i przed wysyłką,
-więc uwzględnia wpisy dodane ręcznie. Zmiana kalendarza po kontroli nadal może
-spowodować kolizję; nie ma wspólnej transakcji SQLite i Buffera.
+Tryb `scheduling_mode: customScheduled` pozostaje dostępny dla zgodności ze starszą
+wersją: używa pseudolosowania w ciągu 168 godzin i pól `schedule.window_start`,
+`window_end`, `min_gap_minutes`, `max_posts_per_day`, `min_lead_minutes`.
+`buffer-replan ID_ZADANIA` przelicza tylko niezatwierdzone propozycje w tym trybie.
 
-Przy braku pojemności wiadomość pokazuje brak terminu. Po późnej reakcji albo
-wykryciu kolizji Pyk szuka terminu w ciągu kolejnych 7 dni względem bieżącego czasu
-i aktualizuje wiadomość. Terminów już przyjętych na choćby jednym koncie nie
-przesuwa automatycznie; brakujące konta mogą wymagać ręcznego rozstrzygnięcia.
+## Segmenty dłuższe niż 3 minuty
 
-Po aktualizacji wcześniejsze propozycje terminów można przeliczyć dla wybranego
-zadania. Polecenie dotyczy tylko rozdziałów, których nikt jeszcze nie zatwierdził,
-i aktualizuje wiadomości z linkami przez outbox bota:
+Nowe segmenty dłuższe niż 180 sekund są dzielone na minimalną liczbę możliwie
+równych części: 5 minut daje dwie części po około 2,5 minuty. Granica może zostać
+przesunięta do 15 sekund do rozpoznanego końca zdania lub pauzy, jeśli wszystkie
+części nadal mieszczą się w limicie. Gdy transkrypcja nie daje odpowiedniej granicy,
+stosowane jest równe cięcie; ASR bez czasów słów nie gwarantuje granicy zdania.
 
-```sh
-docker compose run --rm --no-deps bot buffer-replan PELNY_ID_ZADANIA
-```
-
-Wpisy już zatwierdzone lub zaplanowane w Bufferze zachowują swój termin.
+Każda część ma przez cały czas napis `part 1`, `part 2` itd. na górze, czarny na
+białym tle, w obu wariantach kadru. Krótkie segmenty nie dostają tego napisu.
+Wiadomość rozdziału zawiera linki do wszystkich części. Jedna reakcja zatwierdza
+wybrany wariant wszystkich części, a opis i tytuł publikacji zawierają numer części.
+Pyk wysyła części w kolejności do kolejnych slotów każdego konta. Nie wymusza
+jednoczesnej publikacji ani sąsiadujących godzin na różnych platformach; wpisy
+dodane równolegle w Bufferze mogą zająć slot między częściami. Niepowodzenie lub
+nieznany wynik wcześniejszej części blokuje późniejsze części tylko na tym koncie.
+Wcześniej gotowe klipy i częściowo wysłane stare pliki nie są automatycznie
+renderowane ponownie.
 
 `max_video_seconds` i `max_text_chars` to konfigurowalne ograniczenia Pyk, nie lista
 gwarancji platform. Domyślny ostrożny limit to 180 sekund i 2000 znaków. Dostosuj
@@ -135,6 +142,15 @@ na potrzeby kontroli retencji. Nie zmienia polityki lifecycle bucketa. Wymagana
 jest publiczna dostępność HTTPS i rzeczywista retencja zgodna z YAML; wygasające
 presigned URL nie nadają się do tej integracji.
 
+Przed wysyłką Pyk sprawdza harmonogram konta i kolejkę: musi istnieć slot przed
+końcem retencji z zapasem, również po ostatnim obecnie zaplanowanym wpisie.
+To ostrożna kontrola dostępności, nie samodzielne wyznaczanie daty publikacji.
+Brak slotów lub zbyt długa kolejka powodują błąd konkretnej części/konta.
+Nie ma transakcji obejmującej odczyt i zapis Buffera: jeśli rzeczywisty zwrócony
+termin albo późniejsze ręczne przesunięcie przekracza retencję, wiadomość pokazuje
+ostrzeżenie. Przyspiesz wtedy wpis w Bufferze lub zapewnij dłuższą dostępność pliku.
+Pyk nie usuwa przyjętego wpisu i nie tworzy go ponownie.
+
 Wiadomość z linkami pokazuje wybrany wariant, datę i wynik per konto:
 
 - oczekuje — czeka na opis lub wykonanie próby;
@@ -150,7 +166,8 @@ potwierdzony tryb `automatic`, stan, film, opis i termin. Nie przełącza się n
 przypomnienia. Przy 429 respektuje `Retry-After`; jednoznacznie nieudane próby są
 ograniczone do trzech. Buffer nie dokumentuje idempotencji `createPost`. Timeout,
 niejednoznaczny błąd serwera albo restart podczas wysyłki powoduje odczyt kalendarza
-i próbę znalezienia wpisu po koncie, terminie, tekście i URL. Brak wpisu w jednym
+i próbę znalezienia unikalnego wpisu po koncie, tekście i URL konkretnej części
+(oraz terminie dla starych żądań `customScheduled`). Brak wpisu w jednym
 odczycie nie powoduje automatycznej ponownej mutacji.
 
 ```sh
@@ -167,6 +184,8 @@ docker compose run --rm --no-deps bot buffer-retry PELNY_ID_ZADANIA NUMER_ROZDZI
 ```
 
 Znany zdalny ID blokuje tę operację: nie wolno odtworzyć istniejącej publikacji.
+Przy podzielonym segmencie dodaj `--part 2`, aby ponowić drugą część; domyślnie
+polecenie dotyczy pierwszej części. Kolejne oczekujące części ruszą po jej przyjęciu.
 Anulowanie lub zmianę wariantu po zatwierdzeniu wykonuje się świadomie w Bufferze;
 zmiany zdalne mogą spowodować stan `unknown`, wymagający sprawdzenia.
 

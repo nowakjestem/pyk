@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import time
 from datetime import UTC, datetime
 from zoneinfo import ZoneInfo
@@ -7,8 +8,21 @@ from zoneinfo import ZoneInfo
 from .buffer import remote_time
 from .config import Config
 from .scheduling import choose_time
+from .segments import clips
 
-SCHEMA = """
+DELIVERY_SCHEMA = """
+CREATE TABLE IF NOT EXISTS buffer_deliveries (
+ job_id TEXT NOT NULL, chapter_index INTEGER NOT NULL, channel_id TEXT NOT NULL,
+ part_index INTEGER NOT NULL DEFAULT 0,
+ status TEXT NOT NULL DEFAULT 'pending', post_id TEXT, request_json TEXT,
+ due_at REAL, attempts INTEGER NOT NULL DEFAULT 0, retry_at REAL NOT NULL DEFAULT 0,
+ detail TEXT NOT NULL DEFAULT '', updated_at REAL NOT NULL DEFAULT 0,
+ PRIMARY KEY(job_id,chapter_index,channel_id,part_index),
+ FOREIGN KEY(job_id,chapter_index) REFERENCES buffer_plans(job_id,chapter_index)
+);
+"""
+SCHEMA = (
+    """
 CREATE TABLE IF NOT EXISTS buffer_plans (
  job_id TEXT NOT NULL REFERENCES jobs(id), chapter_index INTEGER NOT NULL,
  due_at REAL, variant TEXT, accepted_by TEXT, accepted_at REAL,
@@ -16,16 +30,12 @@ CREATE TABLE IF NOT EXISTS buffer_plans (
  revision INTEGER NOT NULL DEFAULT 0,
  PRIMARY KEY(job_id,chapter_index)
 );
-CREATE TABLE IF NOT EXISTS buffer_deliveries (
- job_id TEXT NOT NULL, chapter_index INTEGER NOT NULL, channel_id TEXT NOT NULL,
- status TEXT NOT NULL DEFAULT 'pending', post_id TEXT, request_json TEXT,
- attempts INTEGER NOT NULL DEFAULT 0, retry_at REAL NOT NULL DEFAULT 0,
- detail TEXT NOT NULL DEFAULT '', updated_at REAL NOT NULL DEFAULT 0,
- PRIMARY KEY(job_id,chapter_index,channel_id),
- FOREIGN KEY(job_id,chapter_index) REFERENCES buffer_plans(job_id,chapter_index)
-);
+"""
+    + DELIVERY_SCHEMA
+    + """
 CREATE INDEX IF NOT EXISTS buffer_pending ON buffer_deliveries(status,retry_at);
 """
+)
 
 
 class BufferStore:
@@ -97,12 +107,16 @@ class BufferStore:
                     "SELECT 1 FROM buffer_plans WHERE job_id=? AND chapter_index=?", (job_id, index)
                 ).fetchone():
                     continue
-                due = choose_time(
-                    settings.schedule,
-                    now,
-                    f"{job_id}:{index}:{now.date()}",
-                    [c.id for c in settings.channels],
-                    occupied,
+                due = (
+                    None
+                    if settings.scheduling_mode == "addToQueue"
+                    else choose_time(
+                        settings.schedule,
+                        now,
+                        f"{job_id}:{index}:{now.date()}",
+                        [c.id for c in settings.channels],
+                        occupied,
+                    )
                 )
                 db.execute(
                     "INSERT INTO buffer_plans(job_id,chapter_index,due_at) VALUES(?,?,?)",
@@ -116,7 +130,7 @@ class BufferStore:
             return False
         with self.db.connect(immediate=True) as db:
             row = db.execute(
-                "SELECT o.job_id,o.event_key,j.config_json FROM outbox o JOIN jobs j ON j.id=o.job_id WHERE o.post_id=? AND o.status='sent' AND o.event_key GLOB 'chapter:[0-9]*'",
+                "SELECT o.job_id,o.event_key,j.config_json,j.checkpoint FROM outbox o JOIN jobs j ON j.id=o.job_id WHERE o.post_id=? AND o.status='sent' AND o.event_key GLOB 'chapter:[0-9]*'",
                 (post_id,),
             ).fetchone()
             if not row:
@@ -132,11 +146,13 @@ class BufferStore:
             ).rowcount
             if not changed:
                 return False
-            for c in settings.channels:
-                db.execute(
-                    "INSERT INTO buffer_deliveries(job_id,chapter_index,channel_id) VALUES(?,?,?)",
-                    (row["job_id"], index, c.id),
-                )
+            result = json.loads(row["checkpoint"]).get("results", {}).get(str(index), {})
+            for part_index, _clip in enumerate(clips(result)):
+                for c in settings.channels:
+                    db.execute(
+                        "INSERT INTO buffer_deliveries(job_id,chapter_index,channel_id,part_index) VALUES(?,?,?,?)",
+                        (row["job_id"], index, c.id, part_index),
+                    )
             self._changed(db, row["job_id"], index)
             return True
 
@@ -171,7 +187,10 @@ class BufferStore:
         if not plan:
             return ""
         settings = Config.model_validate_json(self.db.get(job_id)["config_json"]).buffer
-        if plan["due_at"]:
+        queued = settings.scheduling_mode == "addToQueue"
+        if queued:
+            summary = "Termin wybierze Buffer z wolnych slotów po zatwierdzeniu."
+        elif plan["due_at"]:
             due = datetime.fromtimestamp(
                 plan["due_at"], ZoneInfo(settings.schedule.timezone)
             ).strftime("%d.%m.%Y %H:%M")
@@ -180,12 +199,18 @@ class BufferStore:
             summary = "Brak wolnego terminu w ciągu najbliższych 7 dni."
         with self.db.connect() as db:
             deliveries = {
-                r["channel_id"]: dict(r)
+                (r["channel_id"], r["part_index"]): dict(r)
                 for r in db.execute(
                     "SELECT * FROM buffer_deliveries WHERE job_id=? AND chapter_index=?",
                     (job_id, index),
                 )
             }
+        if queued and any(
+            d["request_json"] and json.loads(d["request_json"]).get("mode") == "customScheduled"
+            for d in deliveries.values()
+        ):
+            summary = "Publikacja zachowuje wcześniej zapisany termin."
+            queued = False
         if plan["variant"]:
             summary += f" Wybrano: **{plan['variant']}**."
             labels = {
@@ -198,10 +223,23 @@ class BufferStore:
                 "error": "błąd publikacji",
                 "cancelled": "usunięto w Bufferze",
             }
-            summary += "\n" + " · ".join(
-                f"{c.platform}: {labels.get(deliveries.get(c.id, {}).get('status'), 'oczekuje')}"
-                for c in settings.channels
-            )
+            lines = []
+            for (channel_id, part_index), delivery in sorted(
+                deliveries.items(), key=lambda item: (item[0][1], item[0][0])
+            ):
+                c = next(c for c in settings.channels if c.id == channel_id)
+                line = f"{c.platform}: {labels.get(delivery.get('status'), 'oczekuje')}"
+                if any(key[1] > 0 for key in deliveries):
+                    line = f"part {part_index + 1} — " + line
+                if delivery.get("due_at"):
+                    due = datetime.fromtimestamp(
+                        delivery["due_at"], ZoneInfo(settings.schedule.timezone)
+                    ).strftime("%d.%m.%Y %H:%M")
+                    line += f" — **{due} ({settings.schedule.timezone})**"
+                lines.append(line)
+            if queued:
+                summary = f"Kolejka Buffera. Wybrano: **{plan['variant']}**."
+            summary += "\n" + "\n".join(lines)
             details = sorted({d["detail"] for d in deliveries.values() if d["detail"]})
             if details:
                 summary += "\n" + "\n".join(details)
@@ -214,7 +252,7 @@ class BufferStore:
                 )
                 + ", aby zaplanować publikację."
             )
-        if plan["notice"]:
+        if plan["notice"] and not queued:
             summary += "\n" + plan["notice"]
         return plan["base_message"] + "\n\n" + summary
 
@@ -230,6 +268,8 @@ class BufferStore:
         notice="Termin skorygowano po późnej akceptacji lub wykryciu kolizji.",
     ):
         now = now or datetime.now(UTC)
+        if settings.scheduling_mode == "addToQueue" and unapproved_only:
+            return False
         with self.db.connect(immediate=True) as db:
             plan = db.execute(
                 "SELECT variant FROM buffer_plans WHERE job_id=? AND chapter_index=?",
@@ -266,17 +306,17 @@ class BufferStore:
             return [
                 dict(r)
                 for r in db.execute(
-                    "SELECT * FROM buffer_deliveries WHERE job_id=? AND chapter_index=?",
+                    "SELECT * FROM buffer_deliveries WHERE job_id=? AND chapter_index=? ORDER BY part_index,channel_id",
                     (job_id, index),
                 )
             ]
 
-    def status(self, job_id, index, channel_id, status, detail="", **values):
+    def status(self, job_id, index, channel_id, status, detail="", *, part_index=0, **values):
         with self.db.connect(immediate=True) as db:
             current = dict(
                 db.execute(
-                    "SELECT * FROM buffer_deliveries WHERE job_id=? AND chapter_index=? AND channel_id=?",
-                    (job_id, index, channel_id),
+                    "SELECT * FROM buffer_deliveries WHERE job_id=? AND chapter_index=? AND channel_id=? AND part_index=?",
+                    (job_id, index, channel_id, part_index),
                 ).fetchone()
             )
             values = {
@@ -287,26 +327,53 @@ class BufferStore:
                 "updated_at": time.time(),
             }
             db.execute(
-                "UPDATE buffer_deliveries SET status=:status,detail=:detail,post_id=:post_id,request_json=:request_json,attempts=:attempts,retry_at=:retry_at,updated_at=:updated_at WHERE job_id=:job_id AND chapter_index=:chapter_index AND channel_id=:channel_id",
+                "UPDATE buffer_deliveries SET status=:status,detail=:detail,post_id=:post_id,request_json=:request_json,due_at=:due_at,attempts=:attempts,retry_at=:retry_at,updated_at=:updated_at WHERE job_id=:job_id AND chapter_index=:chapter_index AND channel_id=:channel_id AND part_index=:part_index",
                 values,
             )
-            if current["status"] != status or current["detail"] != detail:
+            if (
+                current["status"] != status
+                or current["detail"] != detail
+                or current["due_at"] != values["due_at"]
+            ):
                 self._changed(db, job_id, index)
 
-    def retry(self, job_id, index, channel_id, *, confirmed_not_created=False):
+    def activate_queue(self):
+        """Refresh old proposals; preserve in-flight and acknowledged custom writes."""
+        with self.db.connect(immediate=True) as db:
+            for row in db.execute(
+                "SELECT p.*,j.config_json FROM buffer_plans p JOIN jobs j ON j.id=p.job_id WHERE p.due_at IS NOT NULL"
+            ).fetchall():
+                if (
+                    Config.model_validate_json(row["config_json"]).buffer.scheduling_mode
+                    != "addToQueue"
+                ):
+                    continue
+                requests = db.execute(
+                    "SELECT request_json FROM buffer_deliveries WHERE job_id=? AND chapter_index=? AND request_json IS NOT NULL",
+                    (row["job_id"], row["chapter_index"]),
+                ).fetchall()
+                if requests:
+                    continue
+                db.execute(
+                    "UPDATE buffer_plans SET due_at=NULL,notice='' WHERE job_id=? AND chapter_index=?",
+                    (row["job_id"], row["chapter_index"]),
+                )
+                self._changed(db, row["job_id"], row["chapter_index"])
+
+    def retry(self, job_id, index, channel_id, *, part_index=0, confirmed_not_created=False):
         with self.db.connect(immediate=True) as db:
             statuses = ("failed", "unknown") if confirmed_not_created else ("failed",)
             current = db.execute(
-                "SELECT * FROM buffer_deliveries WHERE job_id=? AND chapter_index=? AND channel_id=?",
-                (job_id, index, channel_id),
+                "SELECT * FROM buffer_deliveries WHERE job_id=? AND chapter_index=? AND channel_id=? AND part_index=?",
+                (job_id, index, channel_id, part_index),
             ).fetchone()
             if not current or current["status"] not in statuses or current["post_id"]:
                 raise ValueError(
                     "Ponowić można wysyłkę bez znanego wpisu w Bufferze; unknown wymaga potwierdzenia nieutworzenia."
                 )
             changed = db.execute(
-                "UPDATE buffer_deliveries SET status='pending',attempts=0,retry_at=0,detail='',request_json=NULL WHERE job_id=? AND chapter_index=? AND channel_id=?",
-                (job_id, index, channel_id),
+                "UPDATE buffer_deliveries SET status='pending',attempts=0,retry_at=0,detail='',request_json=NULL,due_at=NULL WHERE job_id=? AND chapter_index=? AND channel_id=? AND part_index=?",
+                (job_id, index, channel_id, part_index),
             ).rowcount
             if not changed:
                 raise ValueError(

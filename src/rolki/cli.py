@@ -114,6 +114,7 @@ def parser():
     buffer_retry.add_argument("id")
     buffer_retry.add_argument("chapter", type=int, help="Numer rozdziału, od 1")
     buffer_retry.add_argument("channel_id")
+    buffer_retry.add_argument("--part", type=int, default=1, help="Numer części, od 1")
     buffer_retry.add_argument(
         "--confirmed-not-created",
         action="store_true",
@@ -202,7 +203,17 @@ async def async_main(args, config):
                         "due_at": p["due_at"],
                         "variant": p["variant"],
                         "deliveries": [
-                            {k: d[k] for k in ("channel_id", "status", "post_id", "detail")}
+                            {
+                                k: d[k]
+                                for k in (
+                                    "channel_id",
+                                    "part_index",
+                                    "status",
+                                    "post_id",
+                                    "due_at",
+                                    "detail",
+                                )
+                            }
                             for d in store.deliveries(p["job_id"], p["chapter_index"])
                         ],
                     }
@@ -217,6 +228,11 @@ async def async_main(args, config):
         from .buffer_store import BufferStore
 
         settings = Config.model_validate_json(db.get(args.id)["config_json"])
+        if settings.buffer.scheduling_mode == "addToQueue":
+            print(
+                "Terminy wyznacza Buffer po zatwierdzeniu; buffer-replan dotyczy tylko trybu customScheduled."
+            )
+            return 0
         settings.require_buffer()
         store = BufferStore(db)
         plans = [p for p in store.plans(accepted=False) if p["job_id"] == args.id]
@@ -247,6 +263,7 @@ async def async_main(args, config):
             args.id,
             args.chapter - 1,
             args.channel_id,
+            part_index=args.part - 1,
             confirmed_not_created=args.confirmed_not_created,
         )
         print("Wysyłka do Buffera dodana ponownie do kolejki.")

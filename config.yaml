@@ -9,6 +9,7 @@ mattermost:
 buffer:
   enabled: false
   organization_id: ''
+  scheduling_mode: addToQueue # Sloty skonfigurowane w Bufferze; data po zatwierdzeniu.
   channels: []
 
 paths:

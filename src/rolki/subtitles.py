@@ -269,7 +269,9 @@ def background_events(cue: Cue, style: Subtitles) -> list[str]:
     return result
 
 
-def write_subtitles(cues: list[Cue], root: Path, style: Subtitles, video: Video):
+def write_subtitles(
+    cues: list[Cue], root: Path, style: Subtitles, video: Video, *, part_number=None, duration=None
+):
     root.mkdir(parents=True, exist_ok=True)
     cues = phrase_cues(cues, style)
     srt = "\n\n".join(
@@ -289,6 +291,7 @@ ScaledBorderAndShadow: yes
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
 Style: Default,{style.font},{style.font_size},{ass_color(style.primary_color)},&H000000FF,{ass_color(style.outline_color)},&H80000000,{-1 if style.bold else 0},0,0,0,100,100,0,0,1,{style.outline},{style.shadow},{position.alignment},{style.margin_x},{style.margin_x},{position.margin_v},1
 Style: Box,{style.font},{style.font_size},&HFF000000,&HFF000000,{ass_color(style.background.color, opacity=style.background.opacity)},&HFF000000,{-1 if style.bold else 0},0,0,0,100,100,0,0,3,{style.background.padding},0,{position.alignment},{style.margin_x},{style.margin_x},{position.margin_v},1
+Style: Part,{style.font},{round(video.height / 30)},&H00000000,&H00000000,&H00FFFFFF,&H00FFFFFF,-1,0,0,0,100,100,0,0,3,{round(video.height / 160)},0,8,20,20,{round(video.height / 40)},1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
@@ -301,6 +304,8 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                 dialogue(cue, ass_text(cue.text)),
             )
         )
+        if part_number is not None:
+            events += f"\nDialogue: 2,0:00:00.00,{timestamp(duration, ass=True)},Part,,0,0,0,,part {int(part_number)}"
         (root / f"{variant}.ass").write_text(header + events + "\n", encoding="utf-8")
 
 

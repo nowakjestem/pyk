@@ -47,7 +47,8 @@ async def test_buffer_plan_before_render_and_retention(
     assert all(not p["variant"] for p in store.plans())
     assert "scissors" in db.notification_for_event(job_id, "chapter:0")["message"]
     result = json.loads(db.get(job_id)["checkpoint"])["results"]["0"]
-    assert result["variants"]["crop"]["expires_at"] > store.plan(job_id, 0)["due_at"]
+    assert result["variants"]["crop"]["expires_at"] > 0
+    assert store.plan(job_id, 0)["due_at"] is None
     assert not store.deliveries(job_id, 0)
 
 
@@ -147,6 +148,73 @@ async def test_pipeline_two_variants_per_chapter(db, config, enqueue, fake_media
     assert "**1**" in started["message"] and job_id[:8] in started["message"]
     assert "Film: Film testowy." in started["message"]
     assert "Rozdziałów: 2. Rozpoczynam przetwarzanie." in started["message"]
+
+
+@pytest.mark.parametrize("retry", [False, True])
+async def test_long_segment_parts_render_upload_and_resume(
+    db, config, enqueue, fake_media, monkeypatch, retry
+):
+    calls, storage = fake_media
+    job_id = enqueue()
+    db.checkpoint(
+        job_id,
+        "metadata_done",
+        {
+            "title": "Film",
+            "duration": 310,
+            "chapters": [
+                {"index": 0, "title": "Długi", "start": 0, "end": 300},
+                {"index": 1, "title": "Krótki", "start": 300, "end": 310},
+            ],
+            "results": {},
+        },
+    )
+
+    async def probe(_source):
+        return {"streams": [{"codec_type": "audio"}], "format": {"duration": "310"}}
+
+    async def transcribe(_source, chapter, _root, _config):
+        calls["transcribe"] += 1
+        return (
+            [Cue(140, 148, "Koniec zdania."), Cue(149, 160, "Kolejne zdanie.")]
+            if chapter["index"] == 0
+            else []
+        )
+
+    rendered = []
+
+    async def render(_source, chapter, root, _config, variant):
+        ass = (root / f"{variant}.ass").read_text()
+        rendered.append((chapter["start"], chapter["end"], variant, ass))
+        output = root / f"{variant}.mp4"
+        output.write_bytes(b"rendered")
+        return output
+
+    monkeypatch.setattr("rolki.pipeline.probe", probe)
+    monkeypatch.setattr("rolki.pipeline.transcribe", transcribe)
+    monkeypatch.setattr("rolki.pipeline.render", render)
+    if retry:
+        storage.fail_key = "part-2-letterboxed.mp4"
+    await execute(db, Pipeline(db), db.claim())
+    if retry:
+        assert db.get(job_id)["status"] == "failed"
+        assert db.notification_for_event(job_id, "chapter:0") is None
+        original = json.loads(db.get(job_id)["checkpoint"])["results"]["0"]["parts"]
+        storage.fail_key = None
+        db.retry(job_id)
+        await execute(db, Pipeline(db), db.claim())
+        parts = json.loads(db.get(job_id)["checkpoint"])["results"]["0"]["parts"]
+        assert [(p["start"], p["end"]) for p in original] == [(p["start"], p["end"]) for p in parts]
+    assert db.get(job_id)["status"] == "done"
+    assert calls["transcribe"] == 2 and len(rendered) == 6
+    assert {r[:2] for r in rendered} == {(0, 148), (148, 300), (300, 310)}
+    assert all("Part,,0,0,0,,part 1" in r[3] for r in rendered if r[0] == 0)
+    assert all("Part,,0,0,0,,part 2" in r[3] for r in rendered if r[0] == 148)
+    assert all("Part,,0,0,0,,part" not in r[3] for r in rendered if r[0] == 300)
+    assert len(set(calls["upload"])) == 6
+    message = db.notification_for_event(job_id, "chapter:0")["message"]
+    assert "**part 1**" in message and "**part 2**" in message
+    assert "Gotowych filmów: 6" in db.notification_for_event(job_id, "complete")["message"]
 
 
 async def test_descriptions_use_each_transcript_and_resume_without_paid_repeat(

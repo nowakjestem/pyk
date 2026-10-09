@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import json
 import os
-from datetime import UTC, datetime
+from datetime import UTC, datetime, time, timedelta
+from zoneinfo import ZoneInfo
 
 import aiohttp
 
@@ -91,7 +92,7 @@ class BufferClient:
     async def channels(self, organization_id):
         return (
             await self.request(
-                "query($input: ChannelsInput!) { channels(input: $input) { id name service isDisconnected isLocked isQueuePaused } }",
+                "query($input: ChannelsInput!) { channels(input: $input) { id name service isDisconnected isLocked isQueuePaused timezone postingSchedule { day paused times } } }",
                 {"input": {"organizationId": organization_id}},
             )
         )["channels"]
@@ -106,6 +107,7 @@ class BufferClient:
                 raise PermanentError(
                     "Konto Buffera jest rozłączone, zablokowane lub ma wstrzymaną kolejkę."
                 )
+        return available
 
     async def posts(self, settings: Buffer):
         items, cursor = [], None
@@ -161,7 +163,7 @@ class BufferClient:
         raise AmbiguousResult("Nieznany wynik tworzenia wpisu w Bufferze.")
 
 
-def post_input(channel: BufferChannel, *, url: str, text: str, title: str, due_at: float):
+def post_input(channel: BufferChannel, *, url: str, text: str, title: str, due_at=None):
     metadata = {}
     if channel.platform == "instagram":
         metadata = {
@@ -176,17 +178,19 @@ def post_input(channel: BufferChannel, *, url: str, text: str, title: str, due_a
                 "madeForKids": channel.made_for_kids,
             }
         }
-    return {
+    request = {
         "channelId": channel.id,
         "text": text,
         "schedulingType": "automatic",
-        "mode": "customScheduled",
-        "dueAt": datetime.fromtimestamp(due_at, UTC).isoformat().replace("+00:00", "Z"),
+        "mode": "addToQueue" if due_at is None else "customScheduled",
         "assets": [{"video": {"url": url}}],
         "metadata": metadata,
         "saveToDraft": False,
         "needsApproval": False,
     }
+    if due_at is not None:
+        request["dueAt"] = datetime.fromtimestamp(due_at, UTC).isoformat().replace("+00:00", "Z")
+    return request
 
 
 def remote_time(post):
@@ -201,7 +205,47 @@ def matches(post, request):
     return (
         post.get("channelId") == request["channelId"]
         and post.get("text") == request["text"]
-        and remote_time(post) == remote_time(request)
+        and (request.get("mode") == "addToQueue" or remote_time(post) == remote_time(request))
         and request["assets"][0]["video"]["url"]
         in [a.get("source") for a in post.get("assets", [])]
     )
+
+
+def queue_fits_retention(channel, external, *, now, deadline):
+    """Conservative check only: Buffer still chooses the actual slot.
+
+    A free slot after the latest queued post bounds both filling a gap and
+    appending to the queue. Do not guess or send this timestamp to Buffer.
+    """
+    zone = ZoneInfo(channel["timezone"])
+    tail = max(
+        [now]
+        + [
+            remote_time(p)
+            for p in external
+            if p.get("channelId") == channel["id"]
+            and p.get("status") in ("scheduled", "sending")
+            and remote_time(p) is not None
+        ]
+    )
+    if tail >= deadline:
+        return False
+    schedules = {s["day"]: s for s in channel["postingSchedule"] if not s["paused"]}
+    day = datetime.fromtimestamp(tail, zone).date()
+    last_day = datetime.fromtimestamp(deadline, zone).date()
+    while day <= last_day:
+        for clock in schedules.get(
+            ("mon", "tue", "wed", "thu", "fri", "sat", "sun")[day.weekday()], {}
+        ).get("times", []):
+            wall = datetime.combine(day, time.fromisoformat(clock), zone)
+            # Test both folds; skip nonexistent times during a DST transition.
+            for fold in (0, 1):
+                candidate = wall.replace(fold=fold).timestamp()
+                if datetime.fromtimestamp(candidate, zone).replace(tzinfo=None) != wall.replace(
+                    tzinfo=None
+                ):
+                    continue
+                if tail < candidate < deadline:
+                    return True
+        day += timedelta(days=1)
+    return False
