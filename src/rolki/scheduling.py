@@ -14,6 +14,8 @@ def choose_time(
     seed: str,
     channels: list[str],
     occupied: list[tuple[str, float]],
+    *,
+    not_before: float = 0,
 ) -> float | None:
     """Choose a daytime minute within the next 168 hours for all target accounts."""
     zone = ZoneInfo(settings.timezone)
@@ -39,6 +41,8 @@ def choose_time(
         for minute in candidates:
             candidate = start + timedelta(minutes=minute)
             timestamp = candidate.timestamp()
+            if timestamp < not_before:
+                continue
             # Reject imaginary wall-clock times in a user-configured DST window.
             if datetime.fromtimestamp(timestamp, zone).replace(tzinfo=None) != candidate.replace(
                 tzinfo=None

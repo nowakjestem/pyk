@@ -626,6 +626,142 @@ async def test_one_reaction_queues_all_parts_in_order(db, queue_config, monkeypa
     assert len(client.created) == 6
 
 
+async def test_custom_parts_share_timestamp_across_platforms(db, buffer_config, monkeypatch):
+    job_id = prepare(db, buffer_config, approve=False)
+    add_parts(db, job_id)
+    store = BufferStore(db)
+    store.accept(f"clip-{job_id}-0", "scissors", "member")
+    p, client = publisher(db, monkeypatch)
+    await p.tick(now=NOW.timestamp())
+    assert len(client.created) == 6
+    times = []
+    for part in (0, 1):
+        rows = [d for d in store.deliveries(job_id, 0) if d["part_index"] == part]
+        assert all(d["status"] == "scheduled" for d in rows)
+        assert len({d["due_at"] for d in rows}) == 1
+        times.append(rows[0]["due_at"])
+        requests = client.created[part * 3 : (part + 1) * 3]
+        assert len({r["dueAt"] for r in requests}) == 1
+        assert all(r["mode"] == "customScheduled" for r in requests)
+    assert times[1] - times[0] >= buffer_config.buffer.schedule.min_gap_minutes * 60
+    with db.connect() as conn:
+        occupied = store.occupied(conn, buffer_config.buffer, client.remote)
+    assert len(occupied) == 6
+    assert {t for _, t in occupied} == set(times)
+    await BufferPublisher(db, client).tick(now=NOW.timestamp() + 4000)
+    assert len(client.created) == 6
+
+
+async def test_custom_full_account_holds_whole_clip_and_replans_after_wait(
+    db, buffer_config, monkeypatch
+):
+    job_id = prepare(db, buffer_config)
+    p, client = publisher(db, monkeypatch)
+    client.limit = 1
+    client.remote.append(
+        {
+            "id": "manual",
+            "channelId": "tt",
+            "status": "scheduled",
+            "dueAt": (NOW + timedelta(hours=1)).isoformat(),
+        }
+    )
+    await p.tick(now=NOW.timestamp())
+    assert not client.created
+    assert all(d["status"] == "waiting_capacity" for d in p.store.deliveries(job_id, 0))
+    client.remote.clear()
+    later = NOW.timestamp() + 8 * 86400
+    await p.tick(now=later)
+    assert len(client.created) == 3
+    assert len({r["dueAt"] for r in client.created}) == 1
+    assert p.store.plan(job_id, 0)["due_at"] > later
+
+
+async def test_custom_part_failure_holds_next_part_on_all_platforms(db, buffer_config, monkeypatch):
+    job_id = prepare(db, buffer_config, approve=False)
+    add_parts(db, job_id)
+    store = BufferStore(db)
+    store.accept(f"clip-{job_id}-0", "scissors", "member")
+    p, client = publisher(db, monkeypatch)
+    client.failure = lambda r: PermanentError("Odrzucono") if r["channelId"] == "tt" else None
+    await p.tick(now=NOW.timestamp())
+    assert len(client.created) == 3
+    assert all(
+        d["status"] == "pending" for d in store.deliveries(job_id, 0) if d["part_index"] == 1
+    )
+    client.failure = None
+    store.retry(job_id, 0, "tt")
+    await p.tick(now=NOW.timestamp() + 30)
+    assert len(client.created) == 7
+    assert all(d["status"] == "scheduled" for d in store.deliveries(job_id, 0))
+    assert client.created[1]["dueAt"] == client.created[3]["dueAt"]
+
+
+@pytest.mark.parametrize("missed", [False, True])
+async def test_custom_retry_preserves_shared_time_or_fails_after_it_passes(
+    db, buffer_config, monkeypatch, missed
+):
+    job_id = prepare(db, buffer_config)
+    p, client = publisher(db, monkeypatch)
+    client.failure = lambda r: PermanentError("Odrzucono") if r["channelId"] == "tt" else None
+    await p.tick(now=NOW.timestamp())
+    due = p.store.plan(job_id, 0)["due_at"]
+    client.failure = None
+    p.store.retry(job_id, 0, "tt")
+    await p.tick(now=due + 1 if missed else due - 60)
+    if missed:
+        assert len(client.created) == 3
+        failed = next(d for d in p.store.deliveries(job_id, 0) if d["channel_id"] == "tt")
+        assert failed["status"] == "failed" and "termin minął" in failed["detail"]
+    else:
+        assert len(client.created) == 4
+        assert len({r["dueAt"] for r in client.created}) == 1
+
+
+async def test_custom_capacity_race_stops_remaining_accounts(db, buffer_config, monkeypatch):
+    job_id = prepare(db, buffer_config)
+    p, client = publisher(db, monkeypatch)
+    client.failure = lambda r: QueueFull("Limit") if r["channelId"] == "tt" else None
+    await p.tick(now=NOW.timestamp())
+    assert [r["channelId"] for r in client.created] == ["ig", "tt"]
+    assert [d["status"] for d in p.store.deliveries(job_id, 0)] == [
+        "scheduled",
+        "waiting_capacity",
+        "waiting_capacity",
+    ]
+    client.failure = None
+    await p.tick(now=NOW.timestamp() + 4000)
+    assert [r["channelId"] for r in client.created] == ["ig", "tt", "tt", "yt"]
+    assert len({r["dueAt"] for r in client.created}) == 1
+
+
+async def test_custom_parts_restart_after_remote_write_preserves_times(
+    db, buffer_config, monkeypatch
+):
+    job_id = prepare(db, buffer_config, approve=False)
+    add_parts(db, job_id)
+    store = BufferStore(db)
+    store.accept(f"clip-{job_id}-0", "scissors", "member")
+    p, client = publisher(db, monkeypatch)
+    create = client.create
+
+    async def interrupted(request):
+        await create(request)
+        raise asyncio.CancelledError
+
+    client.create = interrupted
+    with pytest.raises(asyncio.CancelledError):
+        await p.tick(now=NOW.timestamp())
+    client.create = create
+    restarted = BufferPublisher(db, client)
+    monkeypatch.setattr(restarted, "check_media", p.check_media)
+    await restarted.tick(now=NOW.timestamp() + 30)
+    assert len(client.created) == 6
+    assert len({r["dueAt"] for r in client.created[:3]}) == 1
+    assert len({r["dueAt"] for r in client.created[3:]}) == 1
+    assert all(d["status"] == "scheduled" for d in store.deliveries(job_id, 0))
+
+
 @pytest.mark.parametrize("ambiguous", [False, True])
 async def test_first_part_failure_blocks_later_only_on_that_account(
     db, queue_config, monkeypatch, ambiguous

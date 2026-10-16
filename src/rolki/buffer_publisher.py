@@ -5,9 +5,7 @@ import fcntl
 import json
 import logging
 import time
-from datetime import UTC, datetime
 from urllib.parse import urlsplit
-from zoneinfo import ZoneInfo
 
 import aiohttp
 
@@ -184,39 +182,9 @@ class BufferPublisher:
             d["request_json"] and json.loads(d["request_json"]).get("mode") == "customScheduled"
             for d in deliveries
         )
-        due = plan["due_at"] if custom else None
-        with self.db.connect() as connection:
-            occupied = self.store.occupied(
-                connection, config.buffer, external, exclude=(job_id, index)
-            )
-        zone = ZoneInfo(config.buffer.schedule.timezone)
-        collision = due is not None and any(
-            abs(t - due) < config.buffer.schedule.min_gap_minutes * 60
-            or sum(
-                cid == channel_id
-                and datetime.fromtimestamp(other, zone).date()
-                == datetime.fromtimestamp(due, zone).date()
-                for cid, other in occupied
-            )
-            >= config.buffer.schedule.max_posts_per_day
-            for channel_id, t in occupied
-            if channel_id in {c.id for c in config.buffer.channels}
-        )
-        if custom and (
-            due is None or due < now + config.buffer.schedule.min_lead_minutes * 60 or collision
-        ):
-            if not self.store.move(
-                job_id, index, config.buffer, external, now=datetime.fromtimestamp(now, UTC)
-            ):
-                for d in pending:
-                    self.delivery_status(
-                        plan,
-                        d,
-                        "failed",
-                        "Brak wolnego terminu lub część kont ma już zapisany termin.",
-                    )
-                return
-            due = self.store.plan(job_id, index)["due_at"]
+        due = None
+        part_times = {}
+        blocked = set()
         text = (
             result.get("description")
             if any(c.get("text", "").strip() for c in result.get("cues", []))
@@ -224,6 +192,55 @@ class BufferPublisher:
         )
         text = text or chapter["title"]
         for d in pending:
+            if custom:
+                part_index = d["part_index"]
+                rows = self.store.deliveries(job_id, index)
+                if part_index in blocked or any(
+                    row["part_index"] < part_index and row["status"] not in ("scheduled", "sent")
+                    for row in rows
+                ):
+                    continue
+                if part_index not in part_times:
+                    group = [row for row in rows if row["part_index"] == part_index]
+                    # A sleeping retry, failed or ambiguous account holds this part together.
+                    if any(
+                        row["status"] not in ("pending", "waiting_capacity", "scheduled", "sent")
+                        or (
+                            row["status"] in ("pending", "waiting_capacity")
+                            and row["retry_at"] > now
+                        )
+                        for row in group
+                    ):
+                        blocked.add(part_index)
+                        continue
+                    unsent = [
+                        row for row in group if row["status"] in ("pending", "waiting_capacity")
+                    ]
+                    if queue_limit is not None and any(
+                        self.store.capacity_used(config.buffer, external, row["channel_id"])
+                        >= queue_limit
+                        for row in unsent
+                    ):
+                        for row in unsent:
+                            self.delivery_status(
+                                plan,
+                                row,
+                                "waiting_capacity",
+                                "Kolejka jednego z kont jest pełna; cały klip czeka na wspólny termin.",
+                                retry_at=now + config.buffer.status_poll_seconds,
+                            )
+                        blocked.add(part_index)
+                        continue
+                    try:
+                        part_times[part_index] = self.store.schedule_part(
+                            job_id, index, part_index, config.buffer, external, now=now
+                        )
+                    except PermanentError as exc:
+                        for row in unsent:
+                            self.delivery_status(plan, row, "failed", str(exc))
+                        blocked.add(part_index)
+                        continue
+                due = part_times[part_index]
             if any(
                 row["channel_id"] == d["channel_id"]
                 and row["part_index"] < d["part_index"]
@@ -307,6 +324,18 @@ class BufferPublisher:
                     request_json=None,
                     retry_at=now + config.buffer.status_poll_seconds,
                 )
+                if custom:
+                    # A concurrent write in Buffer can fill a queue after preflight.
+                    blocked.add(d["part_index"])
+                    for row in self.store.deliveries(job_id, index):
+                        if row["part_index"] == d["part_index"] and row["status"] == "pending":
+                            self.delivery_status(
+                                plan,
+                                row,
+                                "waiting_capacity",
+                                "Klip czeka na miejsce dla wszystkich kont; zachowuje wspólny termin.",
+                                retry_at=now + config.buffer.status_poll_seconds,
+                            )
             except TransientError as exc:
                 attempts = d["attempts"] + 1
                 self.delivery_status(

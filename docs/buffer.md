@@ -1,8 +1,11 @@
 # Publikacja klipów przez Buffer
 
-Pyk dodaje zatwierdzone klipy do kolejki Buffera (`mode: addToQueue`). Buffer wybiera
-wolne sloty z harmonogramu każdego konta. Terminy pojawiają się w wiadomości
-Mattermosta po zatwierdzeniu i mogą wykraczać poza najbliższe 7 dni.
+Pyk planuje zatwierdzone klipy ze wspólną datą publikacji na wszystkich kontach
+(`scheduling_mode: customScheduled`). Każda część filmu dostaje osobny termin,
+wspólny dla Instagrama, TikToka i YouTube. Buffer otrzymuje identyczne `dueAt`
+dla danego klipu, zamiast dobierać osobne okienko z kolejki każdego konta.
+To wspólna zaplanowana data; rzeczywiste przetwarzanie i publikacja na platformach
+mogą powodować opóźnienia.
 
 Na wiadomości z dwoma linkami dodaj:
 
@@ -26,8 +29,8 @@ przy kolejnej kontroli, domyślnie co godzinę.
 
 1. Podłącz konta społecznościowe w Bufferze i sprawdź, że pozwalają na automatyczną
    publikację, a nie tylko przypomnienia na telefon.
-   Ustaw dni, godziny i strefę czasową w **Posting Schedule** każdego konta.
-   To tam ustawiasz dzienne godziny i odstępy między publikacjami.
+   W trybie wspólnych terminów godziny, odstępy i strefę czasową ustawiasz poniżej
+   w `buffer.schedule`; osobne **Posting Schedule** kont nie wyznaczają tych dat.
 2. W [Buffer Settings → API](https://publish.buffer.com/settings/api) utwórz klucz.
    Zapisz `BUFFER_API_KEY` w `.env` na VPS-ie albo jako sekret środowiska cloud
    przeznaczony dla `api.buffer.com`. Nie wpisuj klucza do YAML ani Git.
@@ -49,7 +52,7 @@ Zastąp sekcję `buffer` w YAML, używając rzeczywistych ID:
 buffer:
   enabled: true
   organization_id: 'ID_ORGANIZACJI'
-  scheduling_mode: addToQueue
+  scheduling_mode: customScheduled
   reactions:
     scissors: crop
     frame_with_picture: letterbox
@@ -72,6 +75,11 @@ buffer:
       made_for_kids: false
   schedule:
     timezone: Europe/Warsaw
+    window_start: '10:00'
+    window_end: '20:00'
+    min_gap_minutes: 180
+    max_posts_per_day: 2
+    min_lead_minutes: 120
   retention_margin_hours: 72
   poll_seconds: 30
   status_poll_seconds: 3600
@@ -89,10 +97,12 @@ Kontrola integracji odczytuje stan kont i niczego nie publikuje. Domyślnie inte
 jest wyłączona. Starsze zadania bez konfiguracji Buffera nie dostają harmonogramu
 ani nie uruchamiają publikacji na podstawie historycznych reakcji. Nowe zadania
 zapisują snapshot konfiguracji; zmiana YAML nie zmienia kont tych zadań.
-Domyślny tryb to teraz `addToQueue`, także dla wcześniejszych snapshotów bez pola
-`scheduling_mode`. Po restarcie bota stare propozycje terminów zostają usunięte z
-nieuruchomionych planów, a wiadomości odświeżone. Już wysłane wpisy i zapisane
-żądania `customScheduled` zachowują dotychczasową obsługę, bez ponownej publikacji.
+Konfiguracja w repozytorium wybiera `customScheduled`. Na istniejącym VPS-ie zmień
+`buffer.scheduling_mode` z `addToQueue` na `customScheduled` przed przebudowaniem.
+Nowy tryb dotyczy nowych zadań: zapisane snapshoty i wpisy przyjęte przez Buffer
+zachowują dotychczasowy tryb. Sam restart nie przenosi już zaplanowanych publikacji.
+Domyślna wartość modelu konfiguracji pozostaje `addToQueue` dla zgodności ze starymi
+snapshotami bez tego pola. Pyk nie publikuje ponownie zaakceptowanych wpisów.
 Wyłączenie `buffer.enabled` w aktualnej konfiguracji bota zatrzymuje konsumenta
 lokalnej kolejki i obsługę nowych reakcji, ale nie anuluje wpisów już przyjętych przez Buffer.
 
@@ -109,7 +119,11 @@ Po zapełnieniu kolejki zatwierdzony klip pozostaje w SQLite ze statusem
 `waiting_capacity`; Mattermost pokazuje „czeka na wolne miejsce w Bufferze”.
 Pyk sprawdza dostępność ponownie co `status_poll_seconds` (domyślnie godzinę), także
 po restarcie. Publikacja lub usunięcie wpisu zwalnia miejsce, a Pyk wysyła kolejny
-materiał bez ponownej reakcji. Pełne konto nie blokuje pozostałych platform.
+materiał bez ponownej reakcji. W `customScheduled` Pyk sprawdza pojemność wszystkich
+kont przed pierwszą wysyłką danej części: pełne konto wstrzymuje cały klip.
+Jeśli żadne konto nie przyjęło jeszcze klipu, przeterminowaną datę można wyznaczyć
+ponownie dla całej grupy. Po przyjęciu wpisu przez choć jedno konto pozostałe
+zachowują tę samą datę; gdy minie, otrzymują błąd wymagający sprawdzenia w Bufferze.
 Jednoznaczna odpowiedź API `LimitReachedError`, np. po równoległym dodaniu wpisu
 w UI, również powoduje oczekiwanie, bez wyczerpywania trzech prób wysyłki.
 Pozostałe błędy i nieznane wyniki zachowują dotychczasową obsługę.
@@ -117,16 +131,17 @@ Przed wznowieniem nadal sprawdzamy dostępność filmu do terminu publikacji;
 zbyt długie oczekiwanie może wymagać ponownego przygotowania wygasłego pliku.
 Wysyłki już zakończone błędem w starszej wersji wymagają `buffer-retry`.
 
-Buffer wybiera termin osobno dla każdego konta; Instagram, TikTok i YouTube mogą
-opublikować klip w różnych godzinach. Pyk nie podaje `dueAt`, nie losuje minut i nie
-rezerwuje slotów przed reakcją. `schedule.timezone` służy do wyświetlania terminów
-w Mattermoście; harmonogram i jego strefa czasowa pochodzą z Buffera. Ręczne
-przesunięcia w Bufferze są widoczne po synchronizacji.
+W `customScheduled` Pyk wybiera wspólną minutę w ciągu najbliższych 168 godzin,
+w godzinach `schedule.window_start`–`window_end`, z uwzględnieniem strefy czasowej,
+minimalnego wyprzedzenia, odstępów i dziennego limitu na każdym koncie. Uwzględnia
+też istniejące wpisy Buffera oraz rezerwacje innych klipów i części. Termin zapisuje
+w SQLite przed wysyłką. Restart i ponowienie błędu nie zmieniają daty przyjętych wpisów.
+`buffer-replan ID_ZADANIA` przelicza tylko niezatwierdzone propozycje.
 
-Tryb `scheduling_mode: customScheduled` pozostaje dostępny dla zgodności ze starszą
-wersją: używa pseudolosowania w ciągu 168 godzin i pól `schedule.window_start`,
-`window_end`, `min_gap_minutes`, `max_posts_per_day`, `min_lead_minutes`.
-`buffer-replan ID_ZADANIA` przelicza tylko niezatwierdzone propozycje w tym trybie.
+Opcjonalne `scheduling_mode: addToQueue` zachowuje starsze zachowanie: Buffer wybiera
+termin osobno dla każdego konta, bez przekazywania `dueAt`. Daty mogą się różnić
+i wykraczać poza 7 dni. Pełne konto w tym trybie nie blokuje pozostałych platform;
+`schedule.timezone` służy tylko do wyświetlania terminów w Mattermoście.
 
 ## Segmenty dłuższe niż 3 minuty
 
@@ -140,10 +155,11 @@ Każda część ma przez cały czas napis `part 1`, `part 2` itd. na górze, cza
 białym tle, w obu wariantach kadru. Krótkie segmenty nie dostają tego napisu.
 Wiadomość rozdziału zawiera linki do wszystkich części. Jedna reakcja zatwierdza
 wybrany wariant wszystkich części, a opis i tytuł publikacji zawierają numer części.
-Pyk wysyła części w kolejności do kolejnych slotów każdego konta. Nie wymusza
-jednoczesnej publikacji ani sąsiadujących godzin na różnych platformach; wpisy
-dodane równolegle w Bufferze mogą zająć slot między częściami. Niepowodzenie lub
-nieznany wynik wcześniejszej części blokuje późniejsze części tylko na tym koncie.
+W `customScheduled` części mają rosnące terminy, oddalone przynajmniej o
+`schedule.min_gap_minutes`; każda część ma identyczną datę na wszystkich kontach.
+Niepowodzenie lub nieznany wynik wcześniejszej części blokuje późniejsze części
+na wszystkich platformach do wyjaśnienia lub ponowienia błędu. W `addToQueue`
+części trafiają kolejno do osobnych slotów każdego konta, a blokada jest per konto.
 Wcześniej gotowe klipy i częściowo wysłane stare pliki nie są automatycznie
 renderowane ponownie.
 
@@ -167,7 +183,7 @@ na potrzeby kontroli retencji. Nie zmienia polityki lifecycle bucketa. Wymagana
 jest publiczna dostępność HTTPS i rzeczywista retencja zgodna z YAML; wygasające
 presigned URL nie nadają się do tej integracji.
 
-Przed wysyłką Pyk sprawdza harmonogram konta i kolejkę: musi istnieć slot przed
+W `addToQueue` przed wysyłką Pyk sprawdza harmonogram konta i kolejkę: musi istnieć slot przed
 końcem retencji z zapasem, również po ostatnim obecnie zaplanowanym wpisie.
 To ostrożna kontrola dostępności, nie samodzielne wyznaczanie daty publikacji.
 Brak slotów lub zbyt długa kolejka powodują błąd konkretnej części/konta.
@@ -175,6 +191,11 @@ Nie ma transakcji obejmującej odczyt i zapis Buffera: jeśli rzeczywisty zwróc
 termin albo późniejsze ręczne przesunięcie przekracza retencję, wiadomość pokazuje
 ostrzeżenie. Przyspiesz wtedy wpis w Bufferze lub zapewnij dłuższą dostępność pliku.
 Pyk nie usuwa przyjętego wpisu i nie tworzy go ponownie.
+W `customScheduled` kontrola retencji porównuje dostępność pliku bezpośrednio
+ze wspólną datą klipu. API nie zapewnia transakcji obejmującej wszystkie konta:
+błąd platformy lub zapełnienie kolejki przez równoległy wpis może pozostawić częściowy
+sukces. Pyk zachowuje przyjęte wpisy i wspólną datę dla pozostałych; nie obiecuje
+publikacji dokładnie w tej samej sekundzie ani automatycznego wycofania wpisów.
 
 Wiadomość z linkami pokazuje wybrany wariant, datę i wynik per konto:
 

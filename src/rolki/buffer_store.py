@@ -112,25 +112,135 @@ class BufferStore:
                 continue
             other = Config.model_validate_json(row["config_json"]).buffer
             if other.organization_id == settings.organization_id:
-                deliveries = {
-                    d["channel_id"]: d
-                    for d in db.execute(
-                        "SELECT channel_id,post_id FROM buffer_deliveries WHERE job_id=? AND chapter_index=?",
+                deliveries = list(
+                    db.execute(
+                        "SELECT * FROM buffer_deliveries WHERE job_id=? AND chapter_index=?",
                         (row["job_id"], row["chapter_index"]),
                     )
-                }
+                )
                 for c in other.channels:
-                    delivery = deliveries.get(c.id)
-                    post = remote.get(delivery["post_id"]) if delivery else None
-                    if post:
-                        if (
-                            post.get("status") in ("scheduled", "sending")
-                            and remote_time(post) is not None
-                        ):
-                            occupied.append((c.id, remote_time(post)))
-                    else:
+                    targets = [d for d in deliveries if d["channel_id"] == c.id]
+                    if not targets:
                         occupied.append((c.id, row["due_at"]))
+                    for delivery in targets:
+                        post = remote.get(delivery["post_id"])
+                        if post:
+                            if (
+                                post.get("status") in ("scheduled", "sending")
+                                and remote_time(post) is not None
+                            ):
+                                occupied.append((c.id, remote_time(post)))
+                        elif delivery["status"] not in ("sent", "cancelled", "error"):
+                            due = delivery["due_at"]
+                            if due is None and delivery["part_index"] == 0:
+                                due = row["due_at"]
+                            if due is not None:
+                                occupied.append((c.id, due))
         return occupied
+
+    def schedule_part(self, job_id, index, part_index, settings, external, *, now):
+        """Persist one timestamp for every account before creating any remote post."""
+        from .errors import PermanentError
+
+        with self.db.connect(immediate=True) as db:
+            plan = db.execute(
+                "SELECT * FROM buffer_plans WHERE job_id=? AND chapter_index=?", (job_id, index)
+            ).fetchone()
+            deliveries = list(
+                db.execute(
+                    "SELECT * FROM buffer_deliveries WHERE job_id=? AND chapter_index=?",
+                    (job_id, index),
+                )
+            )
+            group = [d for d in deliveries if d["part_index"] == part_index]
+            pinned = [d for d in group if d["post_id"] or d["status"] in ("sending", "unknown")]
+            if pinned:
+                times = {
+                    remote_time(json.loads(d["request_json"])) if d["request_json"] else d["due_at"]
+                    for d in pinned
+                }
+                if len(times) != 1 or None in times or next(iter(times)) <= now:
+                    raise PermanentError(
+                        "Wspólny termin minął lub jest niejednoznaczny. Sprawdź istniejące wpisy w Bufferze; brakujące konta nie dostaną innej daty."
+                    )
+                due = next(iter(times))
+            else:
+                zone = ZoneInfo(settings.schedule.timezone)
+                occupied = self.occupied(db, settings, external, exclude=(job_id, index))
+                occupied.extend(
+                    (d["channel_id"], d["due_at"])
+                    for d in deliveries
+                    if d["part_index"] != part_index
+                    and d["due_at"] is not None
+                    and d["status"] not in ("sent", "cancelled", "error")
+                )
+                previous = max(
+                    (
+                        d["due_at"]
+                        for d in deliveries
+                        if d["part_index"] < part_index and d["due_at"] is not None
+                    ),
+                    default=None,
+                )
+                not_before = previous + settings.schedule.min_gap_minutes * 60 if previous else 0
+                due = group[0]["due_at"]
+                if due is None and part_index == 0:
+                    due = plan["due_at"]
+                channels = {c.id for c in settings.channels}
+                collision = due is not None and (
+                    any(
+                        abs(t - due) < settings.schedule.min_gap_minutes * 60
+                        for cid, t in occupied
+                        if cid in channels
+                    )
+                    or any(
+                        sum(
+                            cid == channel
+                            and datetime.fromtimestamp(t, zone).date()
+                            == datetime.fromtimestamp(due, zone).date()
+                            for cid, t in occupied
+                        )
+                        >= settings.schedule.max_posts_per_day
+                        for channel in channels
+                    )
+                )
+                if (
+                    due is None
+                    or due < now + settings.schedule.min_lead_minutes * 60
+                    or due < not_before
+                    or collision
+                ):
+                    due = choose_time(
+                        settings.schedule,
+                        datetime.fromtimestamp(now, UTC),
+                        f"part:{job_id}:{index}:{part_index}:{datetime.fromtimestamp(now, UTC).date()}",
+                        list(channels),
+                        occupied,
+                        not_before=not_before,
+                    )
+                if due is None:
+                    raise PermanentError(
+                        "Brak wspólnego wolnego terminu w ciągu najbliższych 7 dni."
+                    )
+            db.execute(
+                "UPDATE buffer_deliveries SET due_at=? WHERE job_id=? AND chapter_index=? AND part_index=? AND status IN ('pending','waiting_capacity','failed')",
+                (due, job_id, index, part_index),
+            )
+            if part_index == 0:
+                db.execute(
+                    "UPDATE buffer_plans SET due_at=?,notice=? WHERE job_id=? AND chapter_index=?",
+                    (
+                        due,
+                        "Termin skorygowano po późnej akceptacji lub wykryciu kolizji."
+                        if plan["due_at"] != due
+                        else plan["notice"],
+                        job_id,
+                        index,
+                    ),
+                )
+            if any(d["due_at"] != due for d in group):
+                self._changed(db, job_id, index)
+            return due
 
     def reserve(self, job_id, chapters, settings, external, *, now=None):
         now = now or datetime.now(UTC)
