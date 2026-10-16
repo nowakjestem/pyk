@@ -10,6 +10,9 @@ buffer:
   enabled: false
   organization_id: ''
   scheduling_mode: customScheduled # Jeden wspólny termin klipu na wszystkich platformach.
+  immediate_reactions:
+    zap: crop # ⚡ Publikuj od razu.
+    rocket: letterbox # 🚀 Publikuj od razu.
   channels: []
 
 paths:

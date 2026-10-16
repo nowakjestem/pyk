@@ -93,7 +93,7 @@ class Bot:
             present = {
                 r.get("emoji_name") for r in reactions or [] if r.get("user_id") == self.own_id
             }
-            for emoji in settings.reactions:
+            for emoji in (*settings.reactions, *settings.immediate_reactions):
                 if emoji in present:
                     continue
                 await self.client.request(
@@ -136,7 +136,15 @@ class Bot:
         if not self.config.buffer.enabled:
             return
         store = BufferStore(self.db)
-        for plan in store.plans(accepted=False):
+        for plan in store.plans():
+            if plan["variant"] and (
+                plan["immediate"]
+                or not any(
+                    d["status"] in ("pending", "waiting_capacity", "scheduled")
+                    for d in store.deliveries(plan["job_id"], plan["chapter_index"])
+                )
+            ):
+                continue
             if plan["mattermost_channel"] not in self.config.mattermost.channel_ids:
                 continue
             result = (

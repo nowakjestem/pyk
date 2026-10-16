@@ -248,6 +248,9 @@ class Buffer(Settings):
     reactions: dict[str, Literal["crop", "letterbox"]] = Field(
         default_factory=lambda: {"scissors": "crop", "frame_with_picture": "letterbox"}
     )
+    immediate_reactions: dict[str, Literal["crop", "letterbox"]] = Field(
+        default_factory=lambda: {"zap": "crop", "rocket": "letterbox"}
+    )
     channels: list[BufferChannel] = Field(default_factory=list)
     schedule: BufferSchedule = Field(default_factory=BufferSchedule)
     retention_margin_hours: int = Field(default=72, ge=1)
@@ -258,8 +261,13 @@ class Buffer(Settings):
     def valid_buffer(self):
         if len({c.id for c in self.channels}) != len(self.channels):
             raise ValueError("duplicate Buffer channel")
-        if not self.reactions or any(not re.fullmatch(r"[a-z0-9_+-]+", e) for e in self.reactions):
+        if not self.reactions or any(
+            not re.fullmatch(r"[a-z0-9_+-]+", e)
+            for e in (*self.reactions, *self.immediate_reactions)
+        ):
             raise ValueError("invalid Buffer reaction names")
+        if self.reactions.keys() & self.immediate_reactions.keys():
+            raise ValueError("scheduled and immediate Buffer reactions must differ")
         if self.enabled and not (self.organization_id and self.channels):
             raise ValueError("Buffer requires organization_id and channels")
         return self

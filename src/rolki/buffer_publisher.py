@@ -50,7 +50,7 @@ class BufferPublisher:
         self.db, self.client, self.store = db, client, BufferStore(db)
 
     def delivery_status(self, plan, delivery, status, detail="", **values):
-        self.store.status(
+        return self.store.status(
             plan["job_id"],
             plan["chapter_index"],
             delivery["channel_id"],
@@ -76,16 +76,21 @@ class BufferPublisher:
     def record_post(self, plan, delivery, request, post):
         if (
             not post.get("id")
+            or (delivery.get("post_id") and delivery["post_id"] != post.get("id"))
             or not matches(post, request)
             or post.get("schedulingType") != "automatic"
-            or (post.get("status") in ("scheduled", "sending") and remote_time(post) is None)
+            or (
+                request.get("mode") != "shareNow"
+                and post.get("status") in ("scheduled", "sending")
+                and remote_time(post) is None
+            )
         ):
             self.delivery_status(
                 plan,
                 delivery,
                 "unknown",
                 "Buffer zwrócił inne dane niż żądany film, termin lub tryb publikacji.",
-                post_id=post.get("id"),
+                post_id=delivery.get("post_id") or post.get("id"),
             )
             return
         status = post.get("status")
@@ -106,8 +111,10 @@ class BufferPublisher:
             )
             settings = Config.model_validate_json(plan["config_json"]).buffer
             detail = ""
-            if status in ("scheduled", "sending") and (
-                not expires or due + settings.retention_margin_hours * 3600 >= expires
+            if (
+                request.get("mode") != "shareNow"
+                and status in ("scheduled", "sending")
+                and (not expires or due + settings.retention_margin_hours * 3600 >= expires)
             ):
                 detail = "Termin w Bufferze przekracza retencję filmu. Przyspiesz publikację lub przedłuż dostępność pliku w S3."
             self.delivery_status(
@@ -135,6 +142,57 @@ class BufferPublisher:
         result = state.get("results", {}).get(str(index), {})
         chapter = next((c for c in state.get("chapters", []) if c["index"] == index), None)
         for d in deliveries:
+            if (
+                plan["immediate"]
+                and d["status"] in ("pending", "waiting_capacity")
+                and d["post_id"]
+            ):
+                post = next((p for p in external if p["id"] == d["post_id"]), None)
+                if not post:
+                    self.delivery_status(
+                        plan,
+                        d,
+                        "failed",
+                        "Wpis nie jest widoczny w Bufferze; nie utworzono duplikatu.",
+                    )
+                elif (
+                    post.get("status") in ("sent", "sending") or post.get("shareMode") == "shareNow"
+                ):
+                    # It may have started publishing between the reaction and this read.
+                    if d["request_json"]:
+                        request = json.loads(d["request_json"])
+                        if post.get("shareMode") == "shareNow":
+                            request["mode"] = "shareNow"
+                            request.pop("dueAt", None)
+                            self.delivery_status(
+                                plan, d, "pending", request_json=json.dumps(request)
+                            )
+                        self.record_post(plan, d, request, post)
+                elif post.get("status") != "scheduled":
+                    self.delivery_status(
+                        plan,
+                        d,
+                        "failed",
+                        "Wpisu nie można teraz przyspieszyć. Sprawdź jego stan w Bufferze.",
+                    )
+                else:
+                    expected = json.loads(d["request_json"]) if d["request_json"] else None
+                    if expected:
+                        expected["mode"] = (
+                            "addToQueue"  # Check identity/content, allow a moved date.
+                        )
+                    if (
+                        not expected
+                        or not matches(post, expected)
+                        or post.get("schedulingType") != "automatic"
+                    ):
+                        self.delivery_status(
+                            plan,
+                            d,
+                            "failed",
+                            "Treść lub tryb wpisu zmieniono w Bufferze; sprawdź go przed publikacją natychmiastową.",
+                        )
+                continue
             if d["status"] in ("sending", "unknown") and d.get("request_json"):
                 request = json.loads(d["request_json"])
                 candidates = [
@@ -178,9 +236,13 @@ class BufferPublisher:
         if config.descriptions.enabled and "description" not in result:
             return
         # A persisted custom request fixes the mode for the rest of this chapter.
-        custom = config.buffer.scheduling_mode == "customScheduled" or any(
-            d["request_json"] and json.loads(d["request_json"]).get("mode") == "customScheduled"
-            for d in deliveries
+        immediate = bool(plan["immediate"])
+        custom = not immediate and (
+            config.buffer.scheduling_mode == "customScheduled"
+            or any(
+                d["request_json"] and json.loads(d["request_json"]).get("mode") == "customScheduled"
+                for d in deliveries
+            )
         )
         due = None
         part_times = {}
@@ -192,6 +254,11 @@ class BufferPublisher:
         )
         text = text or chapter["title"]
         for d in pending:
+            if immediate and any(
+                row["part_index"] < d["part_index"] and row["status"] != "sent"
+                for row in self.store.deliveries(job_id, index)
+            ):
+                continue
             if custom:
                 part_index = d["part_index"]
                 rows = self.store.deliveries(job_id, index)
@@ -276,7 +343,7 @@ class BufferPublisher:
                         "Retencja S3 nie zapewnia dostępności filmu do terminu publikacji z zapasem."
                     )
                 used = self.store.capacity_used(config.buffer, external, target.id)
-                if queue_limit is not None and used >= queue_limit:
+                if not immediate and queue_limit is not None and used >= queue_limit:
                     self.delivery_status(
                         plan,
                         d,
@@ -285,7 +352,7 @@ class BufferPublisher:
                         retry_at=now + config.buffer.status_poll_seconds,
                     )
                     continue
-                if not custom:
+                if not custom and not immediate:
                     account = (channels or {}).get(target.id)
                     if (
                         not account
@@ -303,14 +370,30 @@ class BufferPublisher:
                         )
                 await self.check_media(media["url"])
                 request = post_input(
-                    target, url=media["url"], text=caption, title=title, due_at=due
+                    target,
+                    url=media["url"],
+                    text=caption,
+                    title=title,
+                    due_at=due,
+                    immediate=immediate,
                 )
                 # Persist before network I/O. A crash here conservatively leaves an unknown result.
-                self.delivery_status(
-                    plan, d, "sending", request_json=json.dumps(request), attempts=d["attempts"] + 1
+                if not self.delivery_status(
+                    plan,
+                    d,
+                    "sending",
+                    request_json=json.dumps(request),
+                    attempts=d["attempts"] + 1,
+                    expected_immediate=immediate,
+                ):
+                    return  # A reaction switched this plan to Share Now during media preflight.
+                post = (
+                    await self.client.publish_now(d["post_id"])
+                    if immediate and d["post_id"]
+                    else await self.client.create(request)
                 )
-                post = await self.client.create(request)
                 self.record_post(plan, d, request, post)
+                external[:] = [p for p in external if p["id"] != post.get("id")]
                 external.append(post)
             except AmbiguousResult as exc:
                 self.delivery_status(plan, d, "unknown", str(exc))
@@ -321,8 +404,13 @@ class BufferPublisher:
                     "waiting_capacity",
                     str(exc),
                     attempts=d["attempts"],
-                    request_json=None,
-                    retry_at=now + config.buffer.status_poll_seconds,
+                    request_json=json.dumps(request) if immediate and d["post_id"] else None,
+                    retry_at=now
+                    + (
+                        config.buffer.poll_seconds
+                        if immediate
+                        else config.buffer.status_poll_seconds
+                    ),
                 )
                 if custom:
                     # A concurrent write in Buffer can fill a queue after preflight.
@@ -369,7 +457,7 @@ class BufferPublisher:
         limits = {}
         for plan in sorted(
             self.store.plans(accepted=True),
-            key=lambda p: (p["accepted_at"], p["job_id"], p["chapter_index"]),
+            key=lambda p: (not p["immediate"], p["accepted_at"], p["job_id"], p["chapter_index"]),
         ):
             config = Config.model_validate_json(plan["config_json"])
             deliveries = self.store.deliveries(plan["job_id"], plan["chapter_index"])
@@ -377,9 +465,10 @@ class BufferPublisher:
                 d["status"] in ("pending", "waiting_capacity")
                 and d["retry_at"] <= now
                 and not any(
-                    previous["channel_id"] == d["channel_id"]
+                    (plan["immediate"] or previous["channel_id"] == d["channel_id"])
                     and previous["part_index"] < d["part_index"]
-                    and previous["status"] not in ("scheduled", "sent")
+                    and previous["status"]
+                    not in (("sent",) if plan["immediate"] else ("scheduled", "sent"))
                     for previous in deliveries
                 )
                 for d in deliveries
@@ -404,13 +493,13 @@ class BufferPublisher:
                 if cache_key not in cache:
                     channels = await self.client.verify_channels(config.buffer)
                     cache[cache_key] = (channels, await self.client.posts(config.buffer))
-                if config.buffer.organization_id not in limits:
+                if not plan["immediate"] and config.buffer.organization_id not in limits:
                     limits[config.buffer.organization_id] = await self.client.queue_limit(
                         config.buffer
                     )
                 channels, external = cache[cache_key]
                 await self.process(
-                    plan, config, external, now, channels, limits[config.buffer.organization_id]
+                    plan, config, external, now, channels, limits.get(config.buffer.organization_id)
                 )
                 for d in self.store.deliveries(plan["job_id"], plan["chapter_index"]):
                     if d["status"] in ("scheduled", "unknown"):
@@ -419,7 +508,12 @@ class BufferPublisher:
                             d,
                             d["status"],
                             d["detail"],
-                            retry_at=now + config.buffer.status_poll_seconds,
+                            retry_at=now
+                            + (
+                                config.buffer.poll_seconds
+                                if plan["immediate"]
+                                else config.buffer.status_poll_seconds
+                            ),
                         )
             except (PermanentError, TransientError) as exc:
                 log.warning("Buffer preflight failure_type=%s", type(exc).__name__)

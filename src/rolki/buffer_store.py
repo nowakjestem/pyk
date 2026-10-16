@@ -27,7 +27,7 @@ CREATE TABLE IF NOT EXISTS buffer_plans (
  job_id TEXT NOT NULL REFERENCES jobs(id), chapter_index INTEGER NOT NULL,
  due_at REAL, variant TEXT, accepted_by TEXT, accepted_at REAL,
  base_message TEXT NOT NULL DEFAULT '', notice TEXT NOT NULL DEFAULT '',
- revision INTEGER NOT NULL DEFAULT 0,
+ revision INTEGER NOT NULL DEFAULT 0, immediate INTEGER NOT NULL DEFAULT 0,
  PRIMARY KEY(job_id,chapter_index)
 );
 """
@@ -281,13 +281,52 @@ class BufferStore:
             if not row:
                 return False
             settings = Config.model_validate_json(row["config_json"]).buffer
-            variant = settings.reactions.get(emoji)
+            immediate = emoji in settings.immediate_reactions
+            variant = settings.immediate_reactions.get(emoji) or settings.reactions.get(emoji)
             if not settings.enabled or not variant:
                 return False
             index = int(row["event_key"].split(":")[1])
+            plan = db.execute(
+                "SELECT * FROM buffer_plans WHERE job_id=? AND chapter_index=?",
+                (row["job_id"], index),
+            ).fetchone()
+            if plan and plan["variant"]:
+                if not immediate or plan["immediate"]:
+                    return False
+                deliveries = list(
+                    db.execute(
+                        "SELECT * FROM buffer_deliveries WHERE job_id=? AND chapter_index=?",
+                        (row["job_id"], index),
+                    )
+                )
+                if any(d["status"] in ("sending", "unknown") for d in deliveries):
+                    notice = "Nie można przyspieszyć wysyłki o nieznanym wyniku. Sprawdź wpisy w Bufferze i ponów reakcję po wyjaśnieniu."
+                    if plan["notice"] != notice:
+                        db.execute(
+                            "UPDATE buffer_plans SET notice=? WHERE job_id=? AND chapter_index=?",
+                            (notice, row["job_id"], index),
+                        )
+                        self._changed(db, row["job_id"], index)
+                    return False
+                if not any(
+                    d["status"] in ("pending", "waiting_capacity", "failed", "scheduled")
+                    for d in deliveries
+                ):
+                    return False
+                # Preserve the chosen variant and existing IDs: accelerate using editPost.
+                db.execute(
+                    "UPDATE buffer_plans SET immediate=1,due_at=NULL,notice='',accepted_by=?,accepted_at=? WHERE job_id=? AND chapter_index=?",
+                    (user_id, now or time.time(), row["job_id"], index),
+                )
+                db.execute(
+                    "UPDATE buffer_deliveries SET status='pending',retry_at=0,attempts=0,detail='',due_at=NULL WHERE job_id=? AND chapter_index=? AND status IN ('pending','waiting_capacity','failed','scheduled')",
+                    (row["job_id"], index),
+                )
+                self._changed(db, row["job_id"], index)
+                return True
             changed = db.execute(
-                "UPDATE buffer_plans SET variant=?,accepted_by=?,accepted_at=? WHERE job_id=? AND chapter_index=? AND variant IS NULL",
-                (variant, user_id, now or time.time(), row["job_id"], index),
+                "UPDATE buffer_plans SET variant=?,accepted_by=?,accepted_at=?,immediate=?,due_at=CASE WHEN ? THEN NULL ELSE due_at END WHERE job_id=? AND chapter_index=? AND variant IS NULL",
+                (variant, user_id, now or time.time(), immediate, immediate, row["job_id"], index),
             ).rowcount
             if not changed:
                 return False
@@ -333,7 +372,10 @@ class BufferStore:
             return ""
         settings = Config.model_validate_json(self.db.get(job_id)["config_json"]).buffer
         queued = settings.scheduling_mode == "addToQueue"
-        if queued:
+        if plan["immediate"]:
+            queued = False
+            summary = "Publikacja natychmiastowa na wszystkich platformach."
+        elif queued:
             summary = "Termin wybierze Buffer z wolnych slotów po zatwierdzeniu."
         elif plan["due_at"]:
             due = datetime.fromtimestamp(
@@ -358,6 +400,12 @@ class BufferStore:
             queued = False
         if plan["variant"]:
             summary += f" Wybrano: **{plan['variant']}**."
+            if not plan["immediate"] and settings.immediate_reactions:
+                summary += (
+                    "\nPrzyspiesz publikację wybranego wariantu: "
+                    + " lub ".join(f":{emoji}:" for emoji in settings.immediate_reactions)
+                    + "."
+                )
             labels = {
                 "pending": "oczekuje",
                 "waiting_capacity": "czeka na wolne miejsce w Bufferze",
@@ -375,6 +423,8 @@ class BufferStore:
             ):
                 c = next(c for c in settings.channels if c.id == channel_id)
                 line = f"{c.platform}: {labels.get(delivery.get('status'), 'oczekuje')}"
+                if plan["immediate"] and delivery["status"] == "scheduled":
+                    line = f"{c.platform}: publikacja zlecona"
                 if any(key[1] > 0 for key in deliveries):
                     line = f"part {part_index + 1} — " + line
                 if delivery.get("due_at"):
@@ -398,7 +448,16 @@ class BufferStore:
                 )
                 + ", aby zaplanować publikację."
             )
-        if plan["notice"] and not queued:
+            if settings.immediate_reactions:
+                summary += (
+                    "\nOpublikuj od razu: "
+                    + " lub ".join(
+                        f":{emoji}: ({variant})"
+                        for emoji, variant in settings.immediate_reactions.items()
+                    )
+                    + "."
+                )
+        if plan["notice"] and not queued and not plan["immediate"]:
             summary += "\n" + plan["notice"]
         return plan["base_message"] + "\n\n" + summary
 
@@ -457,8 +516,26 @@ class BufferStore:
                 )
             ]
 
-    def status(self, job_id, index, channel_id, status, detail="", *, part_index=0, **values):
+    def status(
+        self,
+        job_id,
+        index,
+        channel_id,
+        status,
+        detail="",
+        *,
+        part_index=0,
+        expected_immediate=None,
+        **values,
+    ):
         with self.db.connect(immediate=True) as db:
+            if expected_immediate is not None:
+                immediate = db.execute(
+                    "SELECT immediate FROM buffer_plans WHERE job_id=? AND chapter_index=?",
+                    (job_id, index),
+                ).fetchone()[0]
+                if bool(immediate) != expected_immediate:
+                    return False
             current = dict(
                 db.execute(
                     "SELECT * FROM buffer_deliveries WHERE job_id=? AND chapter_index=? AND channel_id=? AND part_index=?",
@@ -482,6 +559,7 @@ class BufferStore:
                 or current["due_at"] != values["due_at"]
             ):
                 self._changed(db, job_id, index)
+            return True
 
     def activate_queue(self):
         """Refresh old proposals; preserve in-flight and acknowledged custom writes."""
@@ -513,6 +591,26 @@ class BufferStore:
                 "SELECT * FROM buffer_deliveries WHERE job_id=? AND chapter_index=? AND channel_id=? AND part_index=?",
                 (job_id, index, channel_id, part_index),
             ).fetchone()
+            if (
+                current
+                and current["status"] == "failed"
+                and current["post_id"]
+                and current["request_json"]
+            ):
+                plan = db.execute(
+                    "SELECT immediate FROM buffer_plans WHERE job_id=? AND chapter_index=?",
+                    (job_id, index),
+                ).fetchone()
+                if (
+                    plan["immediate"]
+                    and json.loads(current["request_json"]).get("mode") == "shareNow"
+                ):
+                    db.execute(
+                        "UPDATE buffer_deliveries SET status='pending',attempts=0,retry_at=0,detail='' WHERE job_id=? AND chapter_index=? AND channel_id=? AND part_index=?",
+                        (job_id, index, channel_id, part_index),
+                    )
+                    self._changed(db, job_id, index)
+                    return
             if not current or current["status"] not in statuses or current["post_id"]:
                 raise ValueError(
                     "Ponowić można wysyłkę bez znanego wpisu w Bufferze; unknown wymaga potwierdzenia nieutworzenia."

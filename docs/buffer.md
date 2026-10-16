@@ -9,21 +9,51 @@ mogą powodować opóźnienia.
 
 Na wiadomości z dwoma linkami dodaj:
 
-- `:scissors:` — publikacja wariantu crop;
-- `:frame_with_picture:` — publikacja wariantu letterbox.
+- `:scissors:` ✂️ — zaplanuj wariant crop;
+- `:frame_with_picture:` 🖼️ — zaplanuj wariant letterbox;
+- `:zap:` ⚡ — opublikuj od razu wariant crop;
+- `:rocket:` 🚀 — opublikuj od razu wariant letterbox.
 
-Bot dodaje obie reakcje do wiadomości z linkami, aby wystarczyło kliknąć gotowe emoji.
+Bot dodaje cztery reakcje do wiadomości z linkami, aby wystarczyło kliknąć gotowe emoji.
 Reakcje bota nie zatwierdzają publikacji: dopiero dodatkowa reakcja użytkownika
 wybiera wariant. Używane są emoji ze snapshotu konfiguracji danego zadania.
 Po restarcie lub błędzie dodawania reakcji bot uzupełnia brakujące reakcje na
-niezatwierdzonych wiadomościach z nadal dostępnymi klipami, bez ponownej wysyłki wiadomości.
+niezatwierdzonych i zaplanowanych wiadomościach z nadal dostępnymi klipami,
+bez ponownej wysyłki wiadomości. Domyślne reakcje natychmiastowe są dostępne także
+dla starszych zadań, których snapshot nie zawierał tego ustawienia.
 
 Każdy członek skonfigurowanego kanału Mattermosta może zatwierdzać; nie ma whitelisty.
 Reakcje botów są ignorowane. Pierwsza poprawna reakcja ustala jeden wariant rozdziału
 dla wszystkich kont docelowych. Kolejne reakcje nie tworzą kolejnych publikacji.
+Na już zatwierdzonym klipie ⚡ lub 🚀 przyspiesza publikację **wcześniej wybranego
+wariantu**, niezależnie od tego, które z tych dwóch emoji klikniesz.
 Reakcja na osobną wiadomość z opisem albo wiadomość źródłową nie uruchamia publikacji.
 Usunięcie reakcji nie anuluje wpisu. Anuluj go w Bufferze; Pyk synchronizuje status
 przy kolejnej kontroli, domyślnie co godzinę.
+
+## Publikacja natychmiastowa
+
+Kliknięcie ⚡ lub 🚀 zapisuje trwałe zlecenie `shareNow` na wszystkie skonfigurowane
+konta. Pyk obsługuje je przed zwykłą kolejką, przy następnym przebiegu konsumenta
+(domyślnie do około 30 sekund). Pomija okno godzin, odstępy, dzienny limit lokalnego
+harmonogramu oraz lokalną kontrolę pojemności kolejki zaplanowanych wpisów.
+Nadal wymaga gotowego klipu, opisu, dostępnego pliku i prawidłowego konta. Buffer
+i platformy mogą narzucić własne limity albo czas przetwarzania; nie jest to gwarancja
+publikacji dokładnie w tej samej sekundzie.
+
+Jeśli wpisy już istnieją, Pyk używa `editPost(mode: shareNow)` z ich zapisanymi ID,
+zamiast tworzyć nowe. Zachowuje wybrany wariant, nie publikuje ponownie wysłanych
+materiałów i nie odtwarza wpisów usuniętych lub zmienionych ręcznie w Bufferze.
+Ręczne przesunięcie samej daty nie blokuje przyspieszenia. Gdy wcześniejsza wysyłka
+ma nieznany wynik albo nadal trwa, trzeba najpierw wyjaśnić jej stan. Timeout po
+przyspieszeniu powoduje synchronizację; nie wywołuje ponownej mutacji w ciemno.
+
+Przy podzielonym rozdziale reakcja dotyczy wszystkich jego części. Pierwsza jest
+publikowana od razu; każda następna dopiero po potwierdzeniu publikacji poprzedniej
+na wszystkich kontach, bez zwykłego odstępu 3 godzin. Statusy tego trybu są odczytywane
+co `poll_seconds`, domyślnie 30 sekund. Brak potwierdzenia lub błąd wcześniejszej
+części zatrzymuje kolejne. Mattermost pokazuje „publikacja zlecona”, a po potwierdzeniu
+przez Buffer — „opublikowano”.
 
 ## Konfiguracja
 
@@ -56,6 +86,9 @@ buffer:
   reactions:
     scissors: crop
     frame_with_picture: letterbox
+  immediate_reactions:
+    zap: crop
+    rocket: letterbox
   channels:
     - id: 'ID_INSTAGRAMA'
       platform: instagram
@@ -103,6 +136,10 @@ Nowy tryb dotyczy nowych zadań: zapisane snapshoty i wpisy przyjęte przez Buff
 zachowują dotychczasowy tryb. Sam restart nie przenosi już zaplanowanych publikacji.
 Domyślna wartość modelu konfiguracji pozostaje `addToQueue` dla zgodności ze starymi
 snapshotami bez tego pola. Pyk nie publikuje ponownie zaakceptowanych wpisów.
+Nowe reakcje nie wymagają edycji YAML: domyślne `immediate_reactions` to
+`zap: crop` i `rocket: letterbox`. Możesz je zmienić albo wyłączyć przez
+`immediate_reactions: {}`. Nazwy emoji publikacji natychmiastowej muszą różnić się
+od tych używanych do planowania.
 Wyłączenie `buffer.enabled` w aktualnej konfiguracji bota zatrzymuje konsumenta
 lokalnej kolejki i obsługę nowych reakcji, ale nie anuluje wpisów już przyjętych przez Buffer.
 
@@ -203,6 +240,7 @@ Wiadomość z linkami pokazuje wybrany wariant, datę i wynik per konto:
 - czeka na wolne miejsce w Bufferze — zatwierdzony klip pozostaje w lokalnej kolejce;
 - wysyłanie — trwa tworzenie wpisu;
 - zaplanowano — Buffer potwierdził automatyczny wpis z filmem i terminem;
+- publikacja zlecona — Buffer przyjął publikację natychmiastową, trwa jej obsługa;
 - opublikowano / błąd publikacji — wynik odczytany z Buffera;
 - wynik nieznany — operacja mogła się udać; Pyk nie powtarza jej w ciemno;
 - błąd — jednoznaczna odmowa, niezgodny format, retencja lub wyczerpane próby;
@@ -230,13 +268,16 @@ operator musi najpierw sprawdzić w Bufferze, że wpis nie powstał. Dopiero wte
 docker compose run --rm --no-deps bot buffer-retry PELNY_ID_ZADANIA NUMER_ROZDZIALU ID_KONTA --confirmed-not-created
 ```
 
-Znany zdalny ID blokuje tę operację: nie wolno odtworzyć istniejącej publikacji.
+Znany zdalny ID blokuje ponowne tworzenie istniejącej publikacji. Wyjątkiem jest
+jednoznacznie nieudane przyspieszenie (`failed`): `buffer-retry` ponawia wtedy
+`editPost` na tym samym ID. Nie dotyczy to nieznanego wyniku operacji (`unknown`).
 Przy podzielonym segmencie dodaj `--part 2`, aby ponowić drugą część; domyślnie
 polecenie dotyczy pierwszej części. Kolejne oczekujące części ruszą po jej przyjęciu.
 Anulowanie lub zmianę wariantu po zatwierdzeniu wykonuje się świadomie w Bufferze;
 zmiany zdalne mogą spowodować stan `unknown`, wymagający sprawdzenia.
 
-Limity API zależą od planu. Statusy są odczytywane godzinowo, a oczekiwanie na opis
+Limity API zależą od planu. Statusy zwykłej kolejki są odczytywane godzinowo,
+a natychmiastowej co `poll_seconds`. Oczekiwanie na opis
 nie powoduje zapytań do Buffera. Duża liczba postów i paginacja mogą zwiększyć liczbę
 odczytów; w razie limitów zwiększ `status_poll_seconds`.
 

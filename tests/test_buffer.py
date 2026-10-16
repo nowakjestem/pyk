@@ -251,6 +251,7 @@ def test_reservations_across_jobs_and_restart(db, buffer_config):
 class FakeClient:
     def __init__(self):
         self.created, self.remote = [], []
+        self.edited = []
         self.failure = None
         self.limit = 10
         self.queue_times = {
@@ -287,15 +288,26 @@ class FakeClient:
             "id": f"remote-{len(self.created)}",
             "channelId": request["channelId"],
             "text": request["text"],
-            "dueAt": request.get("dueAt")
-            or datetime.fromtimestamp(self.queue_times[request["channelId"]], UTC).isoformat(),
-            "status": "scheduled",
+            "dueAt": None
+            if request["mode"] == "shareNow"
+            else (
+                request.get("dueAt")
+                or datetime.fromtimestamp(self.queue_times[request["channelId"]], UTC).isoformat()
+            ),
+            "status": "sending" if request["mode"] == "shareNow" else "scheduled",
             "schedulingType": "automatic",
+            "shareMode": request["mode"],
             "assets": [{"source": request["assets"][0]["video"]["url"]}],
         }
         self.remote.append(p)
         self.queue_times[request["channelId"]] += 86400
         return p
+
+    async def publish_now(self, post_id):
+        self.edited.append(post_id)
+        post = next(p for p in self.remote if p["id"] == post_id)
+        post.update(shareMode="shareNow", status="sending", dueAt=None)
+        return dict(post)
 
 
 def publisher(db, monkeypatch):
@@ -322,6 +334,302 @@ async def test_three_platforms_restart_and_variant(db, buffer_config, monkeypatc
     assert all(d["status"] == "scheduled" for d in store.deliveries(job_id, 0))
     await BufferPublisher(db, client).tick(now=NOW.timestamp() + 30)
     assert len(client.created) == 3
+
+
+@pytest.mark.parametrize("emoji,variant", [("zap", "crop"), ("rocket", "letterbox")])
+@pytest.mark.parametrize("native_queue", [False, True])
+async def test_immediate_reaction_bypasses_schedule_and_full_queue(
+    db, buffer_config, queue_config, monkeypatch, emoji, variant, native_queue
+):
+    settings = queue_config if native_queue else buffer_config
+    job_id = prepare(db, settings, approve=False)
+    store = BufferStore(db)
+    assert store.accept(f"clip-{job_id}-0", emoji, "member")
+    assert store.plan(job_id, 0)["immediate"] and store.plan(job_id, 0)["due_at"] is None
+    p, client = publisher(db, monkeypatch)
+    client.remote = [
+        {"id": f"manual-{i}", "channelId": "ig", "status": "scheduled", "dueAt": NOW.isoformat()}
+        for i in range(10)
+    ]
+    for account in client.accounts.values():
+        account["postingSchedule"] = []
+
+    async def no_limit_read(_settings):
+        raise AssertionError("Share Now must not wait for scheduled queue capacity")
+
+    client.queue_limit = no_limit_read
+    await p.tick(now=NOW.timestamp())
+    assert len(client.created) == 3
+    assert all(r["mode"] == "shareNow" and "dueAt" not in r for r in client.created)
+    assert all(r["assets"][0]["video"]["url"].endswith(f"{variant}.mp4") for r in client.created)
+    assert all(d["status"] == "scheduled" and not d["detail"] for d in store.deliveries(job_id, 0))
+    assert "natychmiastowa" in store.message(job_id, 0)
+    assert not store.accept(f"clip-{job_id}-0", emoji, "again")
+    await p.tick(now=NOW.timestamp() + 31)
+    assert len(client.created) == 3
+
+
+async def test_immediate_parts_wait_for_previous_publication_on_all_accounts(
+    db, buffer_config, monkeypatch
+):
+    job_id = prepare(db, buffer_config, approve=False)
+    add_parts(db, job_id)
+    store = BufferStore(db)
+    assert store.accept(f"clip-{job_id}-0", "zap", "member")
+    p, client = publisher(db, monkeypatch)
+    await p.tick(now=NOW.timestamp())
+    assert len(client.created) == 3
+    client.remote[0]["status"] = "sent"
+    await p.tick(now=NOW.timestamp() + 31)
+    assert len(client.created) == 3
+    for post in client.remote:
+        post["status"] = "sent"
+    await p.tick(now=NOW.timestamp() + 62)
+    assert len(client.created) == 6
+    assert all(r["mode"] == "shareNow" for r in client.created)
+    assert all("part 2" in r["text"] for r in client.created[3:])
+
+
+async def test_immediate_create_restart_reconciles_without_duplicate(
+    db, buffer_config, monkeypatch
+):
+    job_id = prepare(db, buffer_config, approve=False)
+    store = BufferStore(db)
+    store.accept(f"clip-{job_id}-0", "zap", "member")
+    p, client = publisher(db, monkeypatch)
+    create = client.create
+
+    async def interrupted(request):
+        await create(request)
+        raise asyncio.CancelledError
+
+    client.create = interrupted
+    with pytest.raises(asyncio.CancelledError):
+        await p.tick(now=NOW.timestamp())
+    client.create = create
+    await p.tick(now=NOW.timestamp() + 31)
+    assert len(client.created) == 3
+    assert all(d["status"] == "scheduled" for d in store.deliveries(job_id, 0))
+
+
+@pytest.mark.parametrize("reconnect", [False, True])
+async def test_immediate_promotes_existing_posts_without_changing_variant_or_creating_duplicates(
+    db, buffer_config, monkeypatch, reconnect
+):
+    job_id = prepare(db, buffer_config)
+    p, client = publisher(db, monkeypatch)
+    await p.tick(now=NOW.timestamp())
+    original_ids = [d["post_id"] for d in p.store.deliveries(job_id, 0)]
+    reaction = {"post_id": f"clip-{job_id}-0", "user_id": "member", "emoji_name": "rocket"}
+    bot = Bot(buffer_config, db, MattermostFake([reaction]), "own-bot")
+    if reconnect:
+        await bot.reconcile_reactions()
+    else:
+        await bot.handle_reaction(reaction)
+    assert p.store.plan(job_id, 0)["variant"] == "crop"
+    assert p.store.plan(job_id, 0)["immediate"]
+    await p.tick(now=NOW.timestamp() + 31)
+    assert len(client.created) == 3
+    assert client.edited == original_ids
+    assert [d["post_id"] for d in p.store.deliveries(job_id, 0)] == original_ids
+    assert all(post["shareMode"] == "shareNow" for post in client.remote)
+    await bot.handle_reaction(reaction)
+    await p.tick(now=NOW.timestamp() + 62)
+    assert len(client.edited) == 3
+
+
+async def test_immediate_edit_restart_reconciles_existing_id(db, buffer_config, monkeypatch):
+    job_id = prepare(db, buffer_config)
+    p, client = publisher(db, monkeypatch)
+    await p.tick(now=NOW.timestamp())
+    p.store.accept(f"clip-{job_id}-0", "zap", "member")
+    publish_now = client.publish_now
+
+    async def interrupted(post_id):
+        await publish_now(post_id)
+        raise asyncio.CancelledError
+
+    client.publish_now = interrupted
+    with pytest.raises(asyncio.CancelledError):
+        await p.tick(now=NOW.timestamp() + 31)
+    client.publish_now = publish_now
+    await p.tick(now=NOW.timestamp() + 62)
+    assert len(client.created) == 3 and len(client.edited) == 3
+    assert all(d["status"] == "scheduled" for d in p.store.deliveries(job_id, 0))
+
+
+async def test_immediate_reaction_during_scheduled_delivery_switches_remaining_requests(
+    db, buffer_config, monkeypatch
+):
+    job_id = prepare(db, buffer_config)
+    p, client = publisher(db, monkeypatch)
+    checks = 0
+
+    async def media(_url):
+        nonlocal checks
+        checks += 1
+        if checks == 2:
+            assert p.store.accept(f"clip-{job_id}-0", "zap", "member")
+
+    monkeypatch.setattr(p, "check_media", media)
+    await p.tick(now=NOW.timestamp())
+    assert len(client.created) == 1
+    await p.tick(now=NOW.timestamp() + 31)
+    assert len(client.created) == 3 and client.edited == ["remote-1"]
+    assert all(r["mode"] == "shareNow" for r in client.created[1:])
+    assert all(post["shareMode"] == "shareNow" for post in client.remote)
+
+
+async def test_immediate_does_not_recreate_missing_remote_or_republish_sent_post(
+    db, buffer_config, monkeypatch
+):
+    job_id = prepare(db, buffer_config)
+    p, client = publisher(db, monkeypatch)
+    await p.tick(now=NOW.timestamp())
+    client.remote.pop(0)
+    client.remote[0]["status"] = "sent"
+    p.store.accept(f"clip-{job_id}-0", "zap", "member")
+    await p.tick(now=NOW.timestamp() + 31)
+    assert len(client.created) == 3 and len(client.edited) == 1
+    assert [d["status"] for d in p.store.deliveries(job_id, 0)] == ["failed", "sent", "scheduled"]
+
+
+async def test_immediate_refuses_manually_changed_content(db, buffer_config, monkeypatch):
+    job_id = prepare(db, buffer_config)
+    p, client = publisher(db, monkeypatch)
+    await p.tick(now=NOW.timestamp())
+    client.remote[0]["text"] = "Zmieniona treść"
+    client.remote[1]["dueAt"] = (NOW + timedelta(days=3)).isoformat()
+    p.store.accept(f"clip-{job_id}-0", "zap", "member")
+    await p.tick(now=NOW.timestamp() + 31)
+    assert len(client.created) == 3 and len(client.edited) == 2
+    assert p.store.deliveries(job_id, 0)[0]["status"] == "failed"
+
+
+async def test_immediate_edit_lost_response_never_repeats_mutation(db, buffer_config, monkeypatch):
+    job_id = prepare(db, buffer_config)
+    p, client = publisher(db, monkeypatch)
+    await p.tick(now=NOW.timestamp())
+    p.store.accept(f"clip-{job_id}-0", "zap", "member")
+    publish_now = client.publish_now
+
+    async def lost_response(post_id):
+        if post_id == "remote-1":
+            client.edited.append(post_id)
+            raise AmbiguousResult("Utracono odpowiedź")
+        return await publish_now(post_id)
+
+    client.publish_now = lost_response
+    await p.tick(now=NOW.timestamp() + 31)
+    await p.tick(now=NOW.timestamp() + 62)
+    assert len(client.created) == 3 and len(client.edited) == 3
+    assert p.store.deliveries(job_id, 0)[0]["status"] == "unknown"
+
+
+@pytest.mark.parametrize("capacity", [False, True])
+async def test_immediate_failed_edit_retries_existing_id(db, buffer_config, monkeypatch, capacity):
+    job_id = prepare(db, buffer_config)
+    p, client = publisher(db, monkeypatch)
+    await p.tick(now=NOW.timestamp())
+    p.store.accept(f"clip-{job_id}-0", "zap", "member")
+    publish_now = client.publish_now
+
+    async def rejected(post_id):
+        if post_id == "remote-1":
+            raise QueueFull("Limit") if capacity else PermanentError("Odrzucono")
+        return await publish_now(post_id)
+
+    client.publish_now = rejected
+    await p.tick(now=NOW.timestamp() + 31)
+    first = p.store.deliveries(job_id, 0)[0]
+    assert first["status"] == ("waiting_capacity" if capacity else "failed")
+    client.publish_now = publish_now
+    if not capacity:
+        p.store.retry(job_id, 0, "ig")
+    await p.tick(now=NOW.timestamp() + 62)
+    assert len(client.created) == 3 and len(client.edited) == 3
+    assert all(d["status"] == "scheduled" for d in p.store.deliveries(job_id, 0))
+
+
+@pytest.mark.parametrize("warning", [False, True])
+async def test_real_graphql_publish_now_edits_only_existing_id(warning):
+    async def handler(request):
+        body = await request.json()
+        assert "EditPostInput" in body["query"] and "editPost" in body["query"]
+        assert body["variables"]["input"] == {
+            "id": "existing",
+            "mode": "shareNow",
+            "schedulingType": "automatic",
+        }
+        result = {
+            "data": {
+                "editPost": {
+                    "__typename": "PostActionSuccess",
+                    "post": {
+                        "id": "existing",
+                        "status": "sending",
+                        "dueAt": None,
+                        "shareMode": "shareNow",
+                    },
+                }
+            }
+        }
+        if warning:
+            result["errors"] = [{"extensions": {"code": "SOME_WARNING"}}]
+        return web.json_response(result)
+
+    async with http_server(handler) as endpoint, aiohttp.ClientSession() as session:
+        post = await BufferClient(session, endpoint=endpoint).publish_now("existing")
+        assert post["id"] == "existing" and post["dueAt"] is None
+
+
+async def test_immediate_media_expired_and_sent_result_with_no_date(db, buffer_config, monkeypatch):
+    job_id = prepare(db, buffer_config, approve=False)
+    store = BufferStore(db)
+    store.accept(f"clip-{job_id}-0", "zap", "member")
+    p, client = publisher(db, monkeypatch)
+    create = client.create
+
+    async def sent(request):
+        post = await create(request)
+        post["status"] = "sent"
+        return post
+
+    client.create = sent
+    await p.tick(now=NOW.timestamp())
+    assert all(d["status"] == "sent" for d in store.deliveries(job_id, 0))
+    assert not store.accept(f"clip-{job_id}-0", "zap", "again")
+    second = prepare(db, buffer_config, post="expired", approve=False)
+    store.accept(f"clip-{second}-0", "zap", "member")
+    await p.tick(now=NOW.timestamp() + 31 * 86400)
+    assert len(client.created) == 3
+    assert all(d["status"] == "failed" for d in store.deliveries(second, 0))
+
+
+def test_immediate_promotion_refuses_ambiguous_delivery(db, buffer_config):
+    job_id = prepare(db, buffer_config)
+    store = BufferStore(db)
+    store.status(job_id, 0, "ig", "unknown")
+    assert not store.accept(f"clip-{job_id}-0", "zap", "member")
+    assert not store.plan(job_id, 0)["immediate"]
+    assert "nieznanym wyniku" in store.message(job_id, 0)
+
+
+def test_immediate_reaction_names_must_not_overlap():
+    with pytest.raises(ValidationError, match="must differ"):
+        Buffer(immediate_reactions={"scissors": "crop"})
+    with pytest.raises(ValidationError, match="reaction names"):
+        Buffer(immediate_reactions={"bad emoji": "crop"})
+
+
+def test_immediate_schema_upgrade_preserves_existing_plan(db, buffer_config):
+    job_id = prepare(db, buffer_config)
+    store = BufferStore(db)
+    original = store.plan(job_id, 0)
+    with db.connect() as conn:
+        conn.execute("ALTER TABLE buffer_plans DROP COLUMN immediate")
+    upgraded = BufferStore(Database(db.path)).plan(job_id, 0)
+    assert upgraded == original
 
 
 async def test_native_queue_uses_actual_different_dates_beyond_seven_days(
@@ -957,7 +1265,7 @@ class MattermostFake:
 
 
 @pytest.mark.parametrize("failure", [None, "before", "after"])
-async def test_bot_seeds_two_reactions_and_only_human_click_schedules(
+async def test_bot_seeds_four_reactions_and_only_human_click_schedules(
     db, queue_config, monkeypatch, failure
 ):
     job_id = prepare(db, queue_config, approve=False)
@@ -1023,7 +1331,11 @@ async def test_bot_seeds_two_reactions_and_only_human_click_schedules(
             await bot.deliver_notification(notification)
             assert db.notification_for_event(job_id, "chapter:0")["status"] == "sent"
             assert len(posts) == 1
-            assert [r["emoji_name"] for r in reaction_calls] == ["scissors", "frame_with_picture"]
+            assert [r["emoji_name"] for r in reaction_calls] == (
+                ["scissors", "frame_with_picture", "zap", "rocket"]
+                if not failure
+                else ["scissors", "frame_with_picture"]
+            )
             assert all(
                 r["user_id"] == "own-bot" and r["post_id"] == post_id for r in reaction_calls
             )
@@ -1035,8 +1347,8 @@ async def test_bot_seeds_two_reactions_and_only_human_click_schedules(
             bot = Bot(current, db, client, "own-bot")
             await bot.reconcile_reactions()
             await bot.reconcile_reactions()
-            assert len(posts) == 1 and len(reactions) == 2
-            assert len(reaction_calls) == (3 if failure == "before" else 2)
+            assert len(posts) == 1 and len(reactions) == 4
+            assert len(reaction_calls) == (5 if failure == "before" else 4)
             assert not store.plan(job_id, 0)["variant"]
             await bot.handle_reaction(
                 {"post_id": post_id, "user_id": "other-bot", "emoji_name": "scissors"}
@@ -1047,7 +1359,7 @@ async def test_bot_seeds_two_reactions_and_only_human_click_schedules(
                 "/reactions",
                 json={"user_id": "member", "post_id": post_id, "emoji_name": "frame_with_picture"},
             )
-            assert len(reactions) == 3
+            assert len(reactions) == 5
             assert store.plan(job_id, 0)["variant"] == "letterbox"
             await p.tick(now=NOW.timestamp())
             assert len(buffer_client.created) == 3
@@ -1088,7 +1400,12 @@ async def test_recovered_chapter_post_seeds_reactions_without_new_message(db, qu
     client = RecoveredClient([])
     bot = Bot(queue_config, db, client, "own-bot")
     await bot.deliver_notification(notification)
-    assert {r["emoji_name"] for r in client.sent} == {"scissors", "frame_with_picture"}
+    assert {r["emoji_name"] for r in client.sent} == {
+        "scissors",
+        "frame_with_picture",
+        "zap",
+        "rocket",
+    }
     assert db.notification_for_event(job_id, "chapter:0")["post_id"] == post_id
     assert not BufferStore(db).plan(job_id, 0)["variant"]
 

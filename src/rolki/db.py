@@ -30,7 +30,7 @@ CREATE TABLE IF NOT EXISTS outbox (
 );
 CREATE TABLE IF NOT EXISTS cursors (channel_id TEXT PRIMARY KEY, since_ms INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS runtime (name TEXT PRIMARY KEY, heartbeat REAL NOT NULL, detail TEXT NOT NULL);
-PRAGMA user_version=7;
+PRAGMA user_version=8;
 """
 
 
@@ -54,6 +54,10 @@ class Database:
             # Additive tables leave existing jobs and notifications unchanged.
             db.executescript(BUFFER_SCHEMA)
             db.execute("BEGIN IMMEDIATE")
+            if "immediate" not in {row[1] for row in db.execute("PRAGMA table_info(buffer_plans)")}:
+                db.execute(
+                    "ALTER TABLE buffer_plans ADD COLUMN immediate INTEGER NOT NULL DEFAULT 0"
+                )
             columns = {row[1] for row in db.execute("PRAGMA table_info(buffer_deliveries)")}
             if "part_index" not in columns:
                 db.execute(

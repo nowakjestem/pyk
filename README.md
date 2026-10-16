@@ -16,6 +16,8 @@ zatwierdzać. W domyślnej konfiguracji Pyk wyznacza jeden wspólny termin klipu
 Instagrama, TikToka i YouTube, a Buffer zleca automatyczne publikacje na tych kontach.
 Kolejne części mają kolejne wspólne terminy. Pełna kolejka jednego konta zatrzymuje
 wysyłkę tego klipu na pozostałe konta do czasu zwolnienia miejsca.
+Reakcje ⚡ (crop) i 🚀 (letterbox) zlecają publikację od razu na wszystkich kontach.
+Na zatwierdzonym klipie przyspieszają istniejące wpisy, zachowując wybrany wariant.
 Integracja jest domyślnie wyłączona; wymaga klucza API Buffera i podłączenia kont.
 Segmenty ponad 3 minuty dzielimy na możliwie równe części do 180 sekund, z napisem
 `part 1`, `part 2` itd. Jedna reakcja zatwierdza wszystkie części wybranego wariantu.

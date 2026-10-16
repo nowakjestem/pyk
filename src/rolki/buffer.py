@@ -12,7 +12,7 @@ from .errors import JobError, PermanentError, TransientError
 from .openai_http import retry_after_seconds
 
 ENDPOINT = "https://api.buffer.com"
-POST_FIELDS = "id channelId dueAt status schedulingType text assets { source }"
+POST_FIELDS = "id channelId dueAt status schedulingType shareMode text assets { source }"
 
 
 class AmbiguousResult(JobError):
@@ -67,7 +67,10 @@ class BufferClient:
             if (
                 mutation
                 and isinstance(result.get("data"), dict)
-                and result["data"].get("createPost", {}).get("post")
+                and any(
+                    (result["data"].get(name) or {}).get("post")
+                    for name in ("createPost", "editPost")
+                )
             ):
                 # A created post with warnings is still a write. Never retry it.
                 return result["data"]
@@ -166,7 +169,20 @@ class BufferClient:
             {"input": request},
             mutation=True,
         )
-        payload = data.get("createPost", {})
+        return self.post_result(data.get("createPost", {}))
+
+    async def publish_now(self, post_id):
+        data = await self.request(
+            "mutation($input: EditPostInput!) { editPost(input: $input) { __typename ... on PostActionSuccess { post { "
+            + POST_FIELDS
+            + " } } ... on MutationError { message } } }",
+            {"input": {"id": post_id, "mode": "shareNow", "schedulingType": "automatic"}},
+            mutation=True,
+        )
+        return self.post_result(data.get("editPost", {}))
+
+    @staticmethod
+    def post_result(payload):
         if payload.get("__typename") == "PostActionSuccess" and isinstance(
             payload.get("post"), dict
         ):
@@ -180,7 +196,11 @@ class BufferClient:
         raise AmbiguousResult("Nieznany wynik tworzenia wpisu w Bufferze.")
 
 
-def post_input(channel: BufferChannel, *, url: str, text: str, title: str, due_at=None):
+def post_input(
+    channel: BufferChannel, *, url: str, text: str, title: str, due_at=None, immediate=False
+):
+    if immediate and due_at is not None:
+        raise ValueError("Immediate publishing cannot have a scheduled timestamp")
     metadata = {}
     if channel.platform == "instagram":
         metadata = {
@@ -199,7 +219,9 @@ def post_input(channel: BufferChannel, *, url: str, text: str, title: str, due_a
         "channelId": channel.id,
         "text": text,
         "schedulingType": "automatic",
-        "mode": "addToQueue" if due_at is None else "customScheduled",
+        "mode": "shareNow"
+        if immediate
+        else ("addToQueue" if due_at is None else "customScheduled"),
         "assets": [{"video": {"url": url}}],
         "metadata": metadata,
         "saveToDraft": False,
@@ -222,7 +244,14 @@ def matches(post, request):
     return (
         post.get("channelId") == request["channelId"]
         and post.get("text") == request["text"]
-        and (request.get("mode") == "addToQueue" or remote_time(post) == remote_time(request))
+        and (
+            (request.get("mode") == "shareNow" and post.get("shareMode") == "shareNow")
+            or request.get("mode") == "addToQueue"
+            or (
+                request.get("mode") == "customScheduled"
+                and remote_time(post) == remote_time(request)
+            )
+        )
         and request["assets"][0]["video"]["url"]
         in [a.get("source") for a in post.get("assets", [])]
     )
