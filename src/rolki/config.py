@@ -99,6 +99,21 @@ class Descriptions(Settings):
     )
 
 
+class Intro(Settings):
+    # Old job snapshots retain their original boundaries and transcription caches.
+    enabled: bool = False
+    background_color: str = "#71154F"
+    color_tolerance: int = Field(default=28, ge=1, le=60)
+    max_scan_seconds: float = Field(default=6, ge=1, le=30)
+
+    @field_validator("background_color")
+    @classmethod
+    def color(cls, value):
+        if not re.fullmatch(r"#[0-9a-fA-F]{6}", value):
+            raise ValueError("use #RRGGBB colors")
+        return value
+
+
 class Video(Settings):
     width: int = Field(default=720, ge=144, le=2160)
     height: int = Field(default=1280, ge=256, le=3840)
@@ -112,6 +127,7 @@ class Video(Settings):
     fps: int = Field(default=30, ge=1, le=60)
     threads: int = Field(default=2, ge=1, le=4)
     timeout_seconds: int = Field(default=7200, ge=30)
+    intro: Intro = Field(default_factory=Intro)
 
     @model_validator(mode="after")
     def vertical(self):

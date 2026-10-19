@@ -3,6 +3,8 @@
 Bot w prywatnym kanale Mattermosta przyjmuje zwykłe wiadomości z linkiem do YouTube.
 Z każdego rozdziału tworzy dwa MP4 z polskimi napisami: wycięty pionowy kadr oraz pełny
 obraz na pionowym czarnym tle. Publikuje linki S3 w wątku wiadomości źródłowej.
+Przed transkrypcją wykrywa i usuwa początkową bordową planszę z białym napisem;
+długość cięcia wynika z klatek filmu, a nie stałej liczby sekund.
 Po linkach każdego rozdziału wysyła osobną wiadomość z opisem do skopiowania na Instagram/TikTok,
 generowanym z transkrypcji tego rozdziału przez `gpt-6.1-sol` z reasoningiem `low`.
 
@@ -223,6 +225,48 @@ docker compose restart bot worker
 Każde zadanie zapisuje pełną konfigurację i jej hash. Zmiana YAML dotyczy nowych zadań;
 już rozpoczęte zadania wznawiają się z zapisanymi ustawieniami. Sekrety nie trafiają do tego zapisu.
 
+### Usuwanie planszy początkowej
+
+```yaml
+video:
+  intro:
+    enabled: true
+    background_color: '#71154F'
+    color_tolerance: 28
+    max_scan_seconds: 6
+```
+
+Detektor działa lokalnie w FFmpeg i Pythonie, bez modelu AI i dodatkowych zapytań API.
+Analizuje pomniejszone klatki oryginalnego obrazu przed kadrowaniem i dodaniem napisów.
+Sprawdza dominujący kolor tła, jednolite obrzeża oraz biały napis; treść napisu może się zmieniać.
+Tolerancja RGB uwzględnia kompresję, więc klatki nie muszą być identyczne piksel w piksel.
+Nieruchomy obraz sam w sobie nie jest podstawą do cięcia.
+
+`max_scan_seconds` to maksymalne okno poszukiwania końca planszy, **nie długość cięcia**.
+Plansza musi pojawić się na początku rozdziału (do 0,35 s), trwać co najmniej 0,2 s,
+a jej zniknięcie musi potwierdzić co najmniej 0,15 s obrazu. Pojedyncza klatka zakłócenia
+nie kończy planszy. Jednolite bordowe klatki po zniknięciu białego tekstu również są usuwane.
+Rzeczywiste znaczniki czasu klatek wyznaczają punkt cięcia także przy zmiennym FPS.
+Przy braku rozpoznania, niepotwierdzonym końcu lub mniej niż 0,3 s pozostałej treści
+rozdział zostaje bez zmian. Plansze w dalszej części rozdziału nie są usuwane.
+Przenikania i inne warianty graficzne wymagają sprawdzenia na docelowym materiale;
+progi są dostrojone do dołączonej bordowej planszy.
+
+Ten sam wykryty początek obowiązuje audio, transkrypcję i oba warianty obrazu.
+Podział długiego rozdziału na części i limit długości w Bufferze uwzględniają czas po usunięciu planszy.
+**Dźwięk z czasu planszy jest usuwany razem z obrazem** — dotyczy to również ewentualnej
+wypowiedzi pod planszą. Decyzja (`start`, `removed_seconds`, `reason`) trafia do checkpointu
+rozdziału jako `intro` i do logu workera. Retry zachowuje granicę i transkrypcję.
+Starsze zapisane konfiguracje bez `intro` zachowują dotychczasowe zachowanie;
+rozdział z już zapisaną transkrypcją nie zmienia granic przy wznowieniu.
+Wyłączenie: `video.intro.enabled: false`.
+
+Po wdrożeniu kodu i konfiguracji prześlij nowe zadanie. Pierwszy test na rzeczywistym filmie
+powinien objąć klip z planszą i klip bez planszy; sprawdź pierwszą klatkę, początek wypowiedzi
+oraz synchronizację napisów. Sam obraz referencyjny nie pozwala zweryfikować przejścia ani audio.
+
+### Styl napisów
+
 Przykład zmiany stylu:
 
 ```yaml
@@ -424,7 +468,9 @@ osobnego, pustego katalogu `--output`. Taka próba wykonuje płatne zapytania AP
 
 ## Granice v1
 
-- Każdy **cały rozdział** daje dwa klipy. Brak rozdziałów kończy zadanie przed downloadem.
+- Każdy rozdział daje dwa warianty klipu (lub części przy dłuższym materiale);
+  rozpoznana początkowa plansza jest opcjonalnie usuwana.
+  Brak rozdziałów kończy zadanie przed downloadem.
 - Obsługiwane są publicznie dostępne filmy do 60 minut, także linki Shorts; playlisty nie są pobierane.
 - Filmy wymagające logowania, aktywne transmisje i automatyczny wybór najlepszych fragmentów nie są obsługiwane.
 - Stały kadr, bez śledzenia osoby. Publiczne linki, bez logowania do pobierania.

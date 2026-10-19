@@ -50,6 +50,11 @@ video:
   fps: 30
   threads: 2
   timeout_seconds: 7200
+  intro:
+    enabled: true
+    background_color: '#71154F' # kolor z przykładowej planszy
+    color_tolerance: 28 # tolerancja kompresji, na kanał RGB
+    max_scan_seconds: 6 # okno analizy, nie długość cięcia
 
 subtitles:
   font: Lato

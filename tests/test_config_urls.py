@@ -69,6 +69,9 @@ def test_yaml_environment_snapshot(tmp_path, monkeypatch):
     [
         {"video": {"width": 721}},
         {"video": {"height": 720}},
+        {"video": {"intro": {"background_color": "bad"}}},
+        {"video": {"intro": {"max_scan_seconds": 0}}},
+        {"video": {"intro": {"color_tolerance": 100}}},
         {"subtitles": {"max_lines": 3}},
         {"subtitles": {"primary_color": "bad"}},
         {"subtitles": {"font": "font,inject"}},

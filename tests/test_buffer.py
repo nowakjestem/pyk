@@ -1216,6 +1216,20 @@ async def test_description_waits_without_api_calls(db, buffer_config, monkeypatc
     assert all(r["text"] == "Opis #test" for r in client.created)
 
 
+async def test_video_duration_limit_accounts_for_removed_intro(db, buffer_config, monkeypatch):
+    job_id = prepare(db, buffer_config)
+    state = json.loads(db.get(job_id)["checkpoint"])
+    state["chapters"][0].update(start=10, end=191)
+    state["results"]["0"]["intro"] = {
+        "start": 11.73, "removed_seconds": 1.73, "reason": "title_removed",
+    }
+    db.checkpoint(job_id, "uploaded", state)
+    p, client = publisher(db, monkeypatch)
+    await p.tick(now=NOW.timestamp())
+    assert len(client.created) == 3
+    assert all(d["status"] == "scheduled" for d in p.store.deliveries(job_id, 0))
+
+
 @pytest.mark.parametrize("problem", ["expired", "duration", "caption"])
 async def test_invalid_media_not_scheduled(db, buffer_config, monkeypatch, problem):
     job_id = prepare(db, buffer_config)

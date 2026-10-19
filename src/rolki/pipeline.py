@@ -14,6 +14,7 @@ from .db import Database, acceptance_message
 from .descriptions import generate_description
 from .errors import PermanentError, ResourceWait, TransientError
 from .filenames import clip_filename, current_output_date
+from .intro import detect_intro
 from .media import chapters_for_source, probe, render, transcribe, validate_chapters
 from .process import retry_network, run_process
 from .resources import check_resources
@@ -121,14 +122,32 @@ class Pipeline:
             chapter_root = root / f"chapter-{chapter['index']:03}"
             if not ready(result):
                 chapter_root.mkdir(parents=True, exist_ok=True)
+                if config.video.intro.enabled and "intro" not in result and "cues" not in result:
+                    check_resources(config)
+                    save(f"detecting_intro:{index}")
+                    result["intro"] = await detect_intro(
+                        source,
+                        chapter,
+                        chapter_root,
+                        config.video.intro,
+                        threads=config.video.threads,
+                    )
+                    log.info("job=%s chapter=%s intro=%s", job["id"], index, result["intro"])
+                    save(f"intro_detected:{index}")
+                # Keep source chapter metadata intact; ASR and both renders use
+                # exactly the same persisted boundary, including after a retry.
+                trimmed_chapter = {
+                    **chapter,
+                    "start": result.get("intro", {}).get("start", chapter["start"]),
+                }
                 if "cues" not in result:
                     save(f"transcribing:{index}")
-                    cues = await transcribe(source, chapter, chapter_root, config)
+                    cues = await transcribe(source, trimmed_chapter, chapter_root, config)
                     result["cues"] = [asdict(cue) for cue in cues]
                     save(f"transcribed:{index}")
                 cues = [cue_from_dict(cue) for cue in result["cues"]]
                 if "parts" not in result and not result["variants"]:
-                    parts = split_chapter(chapter, cues)
+                    parts = split_chapter(trimmed_chapter, cues)
                     if len(parts) > 1:
                         result["parts"] = parts
                         save(f"split:{index}")
@@ -138,12 +157,12 @@ class Pipeline:
                     clip_root.mkdir(parents=True, exist_ok=True)
                     section = (
                         {
-                            **chapter,
-                            "start": chapter["start"] + clip["start"],
-                            "end": chapter["start"] + clip["end"],
+                            **trimmed_chapter,
+                            "start": trimmed_chapter["start"] + clip["start"],
+                            "end": trimmed_chapter["start"] + clip["end"],
                         }
                         if number
-                        else chapter
+                        else trimmed_chapter
                     )
                     clip_cues = [cue_from_dict(c) for c in clip["cues"]]
                     write_subtitles(

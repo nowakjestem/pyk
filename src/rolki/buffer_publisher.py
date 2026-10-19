@@ -324,7 +324,7 @@ class BufferPublisher:
             duration = (
                 clip["end"] - clip["start"]
                 if "number" in clip
-                else chapter["end"] - chapter["start"]
+                else chapter["end"] - result.get("intro", {}).get("start", chapter["start"])
             )
             target = next(c for c in config.buffer.channels if c.id == d["channel_id"])
             try:

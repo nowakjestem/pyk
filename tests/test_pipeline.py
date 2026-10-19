@@ -2,7 +2,7 @@ import json
 
 import pytest
 
-from rolki.config import Descriptions
+from rolki.config import Descriptions, Intro
 from rolki.errors import PermanentError, ResourceWait
 from rolki.pipeline import Pipeline
 from rolki.subtitles import Cue, Word
@@ -56,7 +56,8 @@ async def test_buffer_plan_before_render_and_retention(
 def fake_media(monkeypatch):
     from rolki import pipeline
 
-    calls = {"metadata": 0, "download": 0, "transcribe": 0, "render": [], "upload": []}
+    calls = {"metadata": 0, "download": 0, "transcribe": 0, "render": [], "upload": [],
+             "transcribe_starts": [], "render_starts": []}
 
     async def process(args, **_kwargs):
         operation = args[3]
@@ -83,6 +84,7 @@ def fake_media(monkeypatch):
 
     async def transcribe(_source, _chapter, _root, _config):
         calls["transcribe"] += 1
+        calls["transcribe_starts"].append(_chapter["start"])
         return [
             Cue(
                 0,
@@ -98,6 +100,7 @@ def fake_media(monkeypatch):
 
     async def render(_source, chapter, root, _config, variant):
         calls["render"].append((chapter["index"], variant))
+        calls["render_starts"].append(chapter["start"])
         output = root / f"{variant}.mp4"
         output.write_bytes(b"rendered")
         return output
@@ -120,6 +123,63 @@ def fake_media(monkeypatch):
     monkeypatch.setattr(pipeline, "render", render)
     monkeypatch.setattr(pipeline, "S3Storage", Storage)
     return calls, Storage
+
+
+async def test_detected_intro_boundary_is_shared_and_persisted_on_retry(
+    db, config, enqueue, fake_media, monkeypatch,
+):
+    calls, storage = fake_media
+    video = config.video.model_copy(update={"intro": Intro(enabled=True)})
+    config = config.model_copy(update={"video": video})
+    detected = []
+
+    async def detect(_source, chapter, _root, _settings, **_kwargs):
+        detected.append(chapter["index"])
+        removed = 1.73 if chapter["index"] == 0 else 0
+        return {"start": chapter["start"] + removed, "removed_seconds": removed,
+                "reason": "title_removed" if removed else "no_title_at_start"}
+
+    monkeypatch.setattr("rolki.pipeline.detect_intro", detect)
+    storage.fail_key = "pierwszy-letterboxed.mp4"
+    job_id = enqueue(config=config)
+    await execute(db, Pipeline(db), db.claim())
+    assert db.get(job_id)["status"] == "failed"
+    state = json.loads(db.get(job_id)["checkpoint"])
+    assert state["results"]["0"]["intro"]["start"] == 1.73
+    assert state["chapters"][0]["start"] == 0
+    assert calls["transcribe_starts"] == [1.73]
+    assert calls["render_starts"] == [1.73, 1.73]
+    storage.fail_key = None
+    db.retry(job_id)
+    await execute(db, Pipeline(db), db.claim())
+    assert db.get(job_id)["status"] == "done"
+    assert detected == [0, 1]
+    assert calls["transcribe_starts"] == [1.73, 10]
+    assert calls["render_starts"] == [1.73, 1.73, 10, 10]
+
+
+async def test_enabled_detector_does_not_change_existing_transcripts_on_retry(
+    db, config, enqueue, fake_media, monkeypatch,
+):
+    calls, storage = fake_media
+    config = config.model_copy(update={"video": config.video.model_copy(
+        update={"intro": Intro(enabled=True)}
+    )})
+
+    async def detect(*_args, **_kwargs):
+        pytest.fail("Existing transcripts must retain their original boundary")
+
+    monkeypatch.setattr("rolki.pipeline.detect_intro", detect)
+    job_id = enqueue(config=config)
+    db.checkpoint(job_id, "transcribed:0", {
+        "chapters": [{"index": 0, "title": "Pierwszy", "start": 0, "end": 20}],
+        "title": "Stare zadanie", "duration": 20,
+        "results": {"0": {"variants": {}, "cues": []}},
+    })
+    await execute(db, Pipeline(db), db.claim())
+    assert db.get(job_id)["status"] == "done"
+    assert calls["transcribe"] == 0
+    assert calls["render_starts"] == [0, 0]
 
 
 async def test_pipeline_two_variants_per_chapter(db, config, enqueue, fake_media, monkeypatch):
@@ -151,11 +211,16 @@ async def test_pipeline_two_variants_per_chapter(db, config, enqueue, fake_media
 
 
 @pytest.mark.parametrize("retry", [False, True])
+@pytest.mark.parametrize("intro_seconds", [0, 1.73])
 async def test_long_segment_parts_render_upload_and_resume(
-    db, config, enqueue, fake_media, monkeypatch, retry
+    db, config, enqueue, fake_media, monkeypatch, retry, intro_seconds
 ):
     calls, storage = fake_media
-    job_id = enqueue()
+    if intro_seconds:
+        config = config.model_copy(update={"video": config.video.model_copy(
+            update={"intro": Intro(enabled=True)}
+        )})
+    job_id = enqueue(config=config)
     db.checkpoint(
         job_id,
         "metadata_done",
@@ -175,6 +240,7 @@ async def test_long_segment_parts_render_upload_and_resume(
 
     async def transcribe(_source, chapter, _root, _config):
         calls["transcribe"] += 1
+        assert chapter["start"] == (intro_seconds if chapter["index"] == 0 else 300)
         return (
             [Cue(140, 148, "Koniec zdania."), Cue(149, 160, "Kolejne zdanie.")]
             if chapter["index"] == 0
@@ -182,6 +248,13 @@ async def test_long_segment_parts_render_upload_and_resume(
         )
 
     rendered = []
+    detected = []
+
+    async def detect(_source, chapter, _root, _settings, **_kwargs):
+        detected.append(chapter["index"])
+        removed = intro_seconds if chapter["index"] == 0 else 0
+        return {"start": chapter["start"] + removed, "removed_seconds": removed,
+                "reason": "title_removed" if removed else "no_title_at_start"}
 
     async def render(_source, chapter, root, _config, variant):
         ass = (root / f"{variant}.ass").read_text()
@@ -193,6 +266,7 @@ async def test_long_segment_parts_render_upload_and_resume(
     monkeypatch.setattr("rolki.pipeline.probe", probe)
     monkeypatch.setattr("rolki.pipeline.transcribe", transcribe)
     monkeypatch.setattr("rolki.pipeline.render", render)
+    monkeypatch.setattr("rolki.pipeline.detect_intro", detect)
     if retry:
         storage.fail_key = "part-2-letterboxed.mp4"
     await execute(db, Pipeline(db), db.claim())
@@ -207,9 +281,12 @@ async def test_long_segment_parts_render_upload_and_resume(
         assert [(p["start"], p["end"]) for p in original] == [(p["start"], p["end"]) for p in parts]
     assert db.get(job_id)["status"] == "done"
     assert calls["transcribe"] == 2 and len(rendered) == 6
-    assert {r[:2] for r in rendered} == {(0, 148), (148, 300), (300, 310)}
-    assert all("Part,,0,0,0,,part 1" in r[3] for r in rendered if r[0] == 0)
-    assert all("Part,,0,0,0,,part 2" in r[3] for r in rendered if r[0] == 148)
+    assert {r[:2] for r in rendered} == {
+        (intro_seconds, 148 + intro_seconds), (148 + intro_seconds, 300), (300, 310),
+    }
+    assert detected == ([0, 1] if intro_seconds else [])
+    assert all("Part,,0,0,0,,part 1" in r[3] for r in rendered if r[0] == intro_seconds)
+    assert all("Part,,0,0,0,,part 2" in r[3] for r in rendered if r[0] == 148 + intro_seconds)
     assert all("Part,,0,0,0,,part" not in r[3] for r in rendered if r[0] == 300)
     assert len(set(calls["upload"])) == 6
     message = db.notification_for_event(job_id, "chapter:0")["message"]
