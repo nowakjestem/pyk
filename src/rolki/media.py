@@ -13,7 +13,7 @@ from .errors import PermanentError
 from .openai_asr import parse_openai, parse_text, transcribe_audio
 from .process import run_process
 from .resources import check_resources
-from .subtitles import Cue, parse_whisper
+from .subtitles import Cue
 
 
 def validate_chapters(info: dict, max_duration: int) -> list[dict]:
@@ -219,13 +219,10 @@ async def transcribe_text_windows(
 
 
 async def transcribe(source: Path, chapter: dict, root: Path, config: Config) -> list[Cue]:
-    if config.asr.provider == "local" and not config.asr.model_path.is_file():
-        raise PermanentError("Brak modelu ASR. Uruchom komendę rolki model-download.")
-    if config.asr.provider == "openai":
-        try:
-            config.require_asr()
-        except ValueError as exc:
-            raise PermanentError(str(exc)) from exc
+    try:
+        config.require_asr()
+    except ValueError as exc:
+        raise PermanentError(str(exc)) from exc
     cues = []
     duration = chapter["end"] - chapter["start"]
     for offset in range(0, math.ceil(duration), config.asr.max_chunk_seconds):
@@ -236,58 +233,27 @@ async def transcribe(source: Path, chapter: dict, root: Path, config: Config) ->
         try:
             if silent_audio(audio):
                 continue
-            if config.asr.provider == "openai":
-                if config.asr.model == "gpt-transcribe":
-                    cues.extend(
-                        await transcribe_text_windows(audio, root, config, offset, chunk_duration)
-                    )
-                    continue
-                cached = root / f"openai-{offset:05}.json"
-                if cached.is_file():
-                    try:
-                        document = json.loads(cached.read_text(encoding="utf-8"))
-                    except ValueError as exc:
-                        raise PermanentError(
-                            "Niepoprawny zapis transkrypcji OpenAI na dysku."
-                        ) from exc
-                else:
-                    document = await transcribe_audio(audio, config.asr)
-                chunk_cues = parse_openai(document, offset=offset, duration=chunk_duration)
-                if not cached.is_file():
-                    temporary = cached.with_suffix(".part.json")
-                    temporary.write_text(json.dumps(document, ensure_ascii=False), encoding="utf-8")
-                    temporary.replace(cached)
-                cues.extend(chunk_cues)
+            if config.asr.model == "gpt-transcribe":
+                cues.extend(
+                    await transcribe_text_windows(audio, root, config, offset, chunk_duration)
+                )
                 continue
-            prefix = root / "whisper"
-            await run_process(
-                [
-                    config.asr.binary,
-                    "-m",
-                    str(config.asr.model_path),
-                    "-f",
-                    str(audio),
-                    "-l",
-                    config.asr.language,
-                    "-t",
-                    str(config.asr.threads),
-                    "-ng",
-                    "-ojf",
-                    "-of",
-                    str(prefix),
-                    "-ml",
-                    str(config.subtitles.max_chars_per_line * config.subtitles.max_lines),
-                    "-sow",
-                    "-sns",
-                ],
-                timeout=config.asr.timeout_seconds,
-            )
-            cues.extend(
-                parse_whisper(prefix.with_suffix(".json"), offset=offset, duration=chunk_duration)
-            )
+            cached = root / f"openai-{offset:05}.json"
+            if cached.is_file():
+                try:
+                    document = json.loads(cached.read_text(encoding="utf-8"))
+                except ValueError as exc:
+                    raise PermanentError("Niepoprawny zapis transkrypcji OpenAI na dysku.") from exc
+            else:
+                document = await transcribe_audio(audio, config.asr)
+            chunk_cues = parse_openai(document, offset=offset, duration=chunk_duration)
+            if not cached.is_file():
+                temporary = cached.with_suffix(".part.json")
+                temporary.write_text(json.dumps(document, ensure_ascii=False), encoding="utf-8")
+                temporary.replace(cached)
+            cues.extend(chunk_cues)
         finally:
             audio.unlink(missing_ok=True)
-            (root / "whisper.json").unlink(missing_ok=True)
     (root / "transcript.json").write_text(
         json.dumps([asdict(cue) for cue in cues], ensure_ascii=False), encoding="utf-8"
     )

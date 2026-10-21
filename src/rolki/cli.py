@@ -16,52 +16,12 @@ from pydantic import ValidationError
 
 from .config import Config, load_config
 from .db import Database
-from .errors import JobError, TransientError
+from .errors import JobError
 from .pipeline import Pipeline
-from .process import retry_network, run_process
+from .process import run_process
 from .storage import policies
 from .urls import youtube_links
 from .worker import execute, run_worker, worker_lock
-
-
-async def download_model(config: Config):
-    target = config.asr.model_path
-    if target.is_file():
-        print(f"Model jest dostępny: {target}")
-        return
-    target.parent.mkdir(parents=True, exist_ok=True)
-    source = target.with_suffix(".download")
-    quantized = target.with_suffix(".quantized")
-
-    async def fetch():
-        try:
-            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=1800)) as session:
-                async with session.get(config.asr.model_url) as response:
-                    if response.status >= 400:
-                        raise TransientError(
-                            f"Pobranie modelu nie powiodło się (HTTP {response.status})."
-                        )
-                    with source.open("wb") as output:
-                        async for chunk in response.content.iter_chunked(1024**2):
-                            output.write(chunk)
-                            if shutil.disk_usage(target.parent).free < 512 * 1024**2:
-                                raise JobError("Za mało miejsca na pobranie modelu.")
-        except (aiohttp.ClientError, TimeoutError) as exc:
-            raise TransientError("Błąd połączenia podczas pobierania modelu.") from exc
-
-    try:
-        await retry_network(fetch)
-        if source.stat().st_size < 1024**2:
-            raise JobError("Pobrany model jest niepoprawny.")
-        await run_process(
-            [config.asr.quantizer, str(source), str(quantized), config.asr.quantization],
-            timeout=300,
-        )
-        quantized.replace(target)
-        print(f"Model przygotowany: {target}")
-    finally:
-        source.unlink(missing_ok=True)
-        quantized.unlink(missing_ok=True)
 
 
 async def stoppable(coroutine, grace):
@@ -122,7 +82,6 @@ def parser():
     )
     health = commands.add_parser("health")
     health.add_argument("--worker", action="store_true")
-    commands.add_parser("model-download")
     commands.add_parser("s3-policies", help="Generuje JSON; nie zmienia bucketa")
     run = commands.add_parser("run", help="Pipeline z CLI, bez Mattermosta")
     run.add_argument("url")
@@ -145,8 +104,6 @@ async def async_main(args, config):
                     await BufferClient(session).verify_channels(config.buffer)
         if args.tools:
             binaries = ["ffmpeg", "ffprobe", "deno"]
-            if config.asr.provider == "local":
-                binaries.extend((config.asr.binary, config.asr.quantizer))
             for binary in binaries:
                 if not shutil.which(binary):
                     raise JobError(f"Brak programu: {binary}.")
@@ -163,12 +120,7 @@ async def async_main(args, config):
             }
             if config.subtitles.font.casefold() not in installed:
                 raise JobError(f"Font {config.subtitles.font!r} nie jest zainstalowany.")
-            if config.asr.provider == "local" and not config.asr.model_path.is_file():
-                raise JobError("Brak modelu ASR. Uruchom rolki model-download.")
         print(f"Konfiguracja poprawna. Wersja: {config.revision}")
-        return 0
-    if args.command == "model-download":
-        await download_model(config)
         return 0
     if args.command == "s3-policies":
         config.require_storage()

@@ -155,7 +155,9 @@ async def test_multipart_fields_and_retries_reopen_same_audio(tmp_path, monkeypa
 
     monkeypatch.setattr("rolki.process.asyncio.sleep", no_delay)
     async with server(handler, monkeypatch):
-        result = await transcribe_audio(audio, ASR(provider="openai", prompt="Zażółć"))
+        result = await transcribe_audio(
+            audio, ASR(provider="openai", model="whisper-1", prompt="Zażółć")
+        )
     assert result == transcript() and len(requests) == 3
     assert all(item == requests[0] for item in requests)
     auth, fields = requests[0]
@@ -193,7 +195,9 @@ async def test_rate_limit_follows_retry_after(tmp_path, monkeypatch):
 
     monkeypatch.setattr("rolki.process.asyncio.sleep", sleep)
     async with server(handler, monkeypatch):
-        assert await transcribe_audio(audio, ASR(provider="openai")) == transcript()
+        assert (
+            await transcribe_audio(audio, ASR(provider="openai", model="whisper-1")) == transcript()
+        )
     assert delays == [7.5] and calls == 2
 
 
@@ -253,7 +257,7 @@ async def test_errors_retry_only_transient_without_leaking_api_body(
     monkeypatch.setattr("rolki.process.asyncio.sleep", no_delay)
     async with server(handler, monkeypatch):
         with pytest.raises(error_type) as exc:
-            await transcribe_audio(audio, ASR(provider="openai"))
+            await transcribe_audio(audio, ASR(provider="openai", model="whisper-1"))
     assert calls == attempts
     assert "test-secret" not in str(exc.value) and "private content" not in str(exc.value)
 
@@ -278,7 +282,7 @@ async def test_streamed_quota_error_is_read_fully_before_classification(tmp_path
 
     async with server(handler, monkeypatch):
         with pytest.raises(PermanentError, match="Brak środków"):
-            await transcribe_audio(audio, ASR(provider="openai"))
+            await transcribe_audio(audio, ASR(provider="openai", model="whisper-1"))
     assert calls == 1
 
 
@@ -297,7 +301,9 @@ async def test_auto_language_and_malformed_json(tmp_path, monkeypatch):
 
     async with server(handler, monkeypatch):
         with pytest.raises(PermanentError, match="JSON"):
-            await transcribe_audio(audio, ASR(provider="openai", language="auto"))
+            await transcribe_audio(
+                audio, ASR(provider="openai", model="whisper-1", language="auto")
+            )
     assert "language" not in names and "prompt" not in names
 
 
@@ -319,20 +325,23 @@ async def test_timeout_is_transient(tmp_path, monkeypatch):
     async with server(handler, monkeypatch):
         with pytest.raises(TransientError, match="połączenia"):
             await transcribe_audio(
-                audio, ASR(provider="openai").model_copy(update={"request_timeout_seconds": 0.01})
+                audio,
+                ASR(provider="openai", model="whisper-1").model_copy(
+                    update={"request_timeout_seconds": 0.01}
+                ),
             )
 
 
 async def test_missing_key_and_upload_limit_fail_before_request(tmp_path, monkeypatch):
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     with pytest.raises(PermanentError, match="OPENAI_API_KEY"):
-        await transcribe_audio(tmp_path / "nonexistent", ASR(provider="openai"))
+        await transcribe_audio(tmp_path / "nonexistent", ASR(provider="openai", model="whisper-1"))
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
     audio = tmp_path / "big.wav"
     with audio.open("wb") as file:
         file.truncate(openai_asr.MAX_UPLOAD_BYTES + 1)
     with pytest.raises(PermanentError, match="limit uploadu"):
-        await transcribe_audio(audio, ASR(provider="openai"))
+        await transcribe_audio(audio, ASR(provider="openai", model="whisper-1"))
 
 
 async def test_resume_caches_paid_chunks_and_preserves_relative_word_times(
@@ -341,7 +350,9 @@ async def test_resume_caches_paid_chunks_and_preserves_relative_word_times(
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
     config = config.model_copy(
         update={
-            "asr": config.asr.model_copy(update={"provider": "openai", "max_chunk_seconds": 30})
+            "asr": config.asr.model_copy(
+                update={"provider": "openai", "model": "whisper-1", "max_chunk_seconds": 30}
+            )
         }
     )
     calls = 0
@@ -395,8 +406,13 @@ async def test_openai_silence_does_not_call_api(tmp_path, config, monkeypatch):
     )
 
 
-def test_provider_validation_legacy_jobs_and_secret_snapshot(config, db, monkeypatch):
-    assert Config.model_validate_json(config.model_dump_json()).asr.provider == "local"
+def test_provider_validation_and_secret_snapshot(config, db, monkeypatch):
+    assert Config.model_validate_json(config.model_dump_json()).asr.provider == "openai"
+    assert ASR().model == "gpt-transcribe"
+    with pytest.raises(ValidationError):
+        ASR(provider="local")
+    with pytest.raises(ValidationError):
+        ASR(model_path="models/old.bin")
     with pytest.raises(ValidationError):
         ASR(provider="openai", model="unknown-model")
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
@@ -425,7 +441,7 @@ async def test_tools_check_openai_does_not_need_local_model(config, monkeypatch,
 
     def which(binary):
         tools.append(binary)
-        assert binary not in (api_config.asr.binary, api_config.asr.quantizer)
+        assert binary not in ("whisper-cli", "whisper-quantize")
         return f"/usr/bin/{binary}"
 
     async def process(args, **_):

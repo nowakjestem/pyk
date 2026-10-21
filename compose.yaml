@@ -12,7 +12,6 @@ x-common: &common
   volumes:
     - ./config.yaml:/app/config.yaml:ro
     - ./data:/app/data
-    - ./models:/app/models:ro
   read_only: true
   tmpfs:
     - /tmp:size=32m,mode=1777

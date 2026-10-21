@@ -26,7 +26,6 @@ async def benchmark(args):
     root.mkdir(parents=True, exist_ok=True)
     config = config.model_copy(
         update={
-            "asr": config.asr.model_copy(update={"provider": args.provider}),
             "limits": config.limits.model_copy(
                 update={
                     "min_available_memory_bytes": 0,
@@ -96,9 +95,7 @@ async def benchmark(args):
     maxrss_bytes = maxrss if sys.platform == "darwin" else maxrss * 1024
     report = {
         "asr_provider": config.asr.provider,
-        "asr_model": config.asr.model
-        if config.asr.provider == "openai"
-        else str(config.asr.model_path),
+        "asr_model": config.asr.model,
         "sample": "user-provided" if args.source else "synthetic Polish espeak-ng",
         "duration_seconds": duration,
         "asr_seconds": round(asr_time, 2),
@@ -120,6 +117,5 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=Path, default=Path("config.yaml"))
     parser.add_argument("--source", type=Path)
-    parser.add_argument("--provider", choices=("local", "openai"), default="local")
     parser.add_argument("--output", type=Path, default=Path("data/benchmark"))
     asyncio.run(benchmark(parser.parse_args()))

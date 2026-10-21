@@ -9,7 +9,6 @@ Po linkach każdego rozdziału wysyła osobną wiadomość z opisem do skopiowan
 generowanym z transkrypcji tego rozdziału przez `gpt-6.1-sol` z reasoningiem `low`.
 
 Python 3.12, SQLite, yt-dlp + Deno/EJS, bezpośrednie API OpenAI, FFmpeg/libass i Docker Compose.
-Lokalny whisper.cpp pozostaje opcjonalnym backendem i obsługuje starsze zadania.
 Bez Redis, Celery, publicznego webhooka i panelu administracyjnego.
 
 Opcjonalna [integracja z Buffer](docs/buffer.md) pozwala zatwierdzić rozdział reakcją
@@ -49,8 +48,7 @@ Zasady dostępu opisuje [dokumentacja GHCR](https://docs.github.com/en/packages/
 
 Bot ma limit 128 MiB; worker 768 MiB oraz 2 vCPU. Swap nie jest wymagany ani automatycznie
 tworzony. Jednocześnie działa jeden proces kosztownego etapu. Obie wersje klipu powstają
-kolejno. W trybie OpenAI model działa u dostawcy; VPS wyodrębnia audio i renderuje napisy.
-W opcjonalnym trybie lokalnym model jest zwalniany przed renderowaniem.
+kolejno. Model transkrypcji działa w OpenAI; VPS wyodrębnia audio i renderuje napisy.
 
 Kontrola zapasu pamięci kontenera uwzględnia czysty, nieaktywny cache plików,
 który Linux może odzyskać. Pobrany film w cache nie blokuje kolejnego etapu.
@@ -319,11 +317,7 @@ na czarne tło całej linijki zmień `mode: line` i `color: '#000000'`.
 Domyślny `gpt-transcribe` nie zwraca czasów słów; używaj `mode: line`. Tryb `word`
 również zadziała, ale użyje tła całej linijki. Opcjonalny `asr.model: whisper-1`
 zwraca pełne słowa z czasami; aplikacja zachowuje interpunkcję segmentów i dobiera
-krótkie frazy według granic słów. W opcjonalnym trybie lokalnym Whisper jest uruchamiany
-z `-ojf`: pełny JSON zawiera czasy tokenów. Aplikacja łączy
-tokeny w słowa z interpunkcją i dobiera frazy według granic tych słów. Są to
-[eksperymentalne czasy whisper.cpp](https://github.com/ggml-org/whisper.cpp/tree/v1.8.7#word-level-timestamp-experimental),
-bez dodatkowego modelu forced alignment; mogą być niedokładne. Jeśli dane słów są
+krótkie frazy według granic słów. Jeśli dane słów są
 niekompletne, mają zerową długość lub słowo wymaga podziału między linijkami,
 fraza zachowuje tradycyjne czasy segmentu, a tryb `word` używa tła całej linijki.
 Starsze checkpointy bez czasów słów również działają z tym fallbackiem.
@@ -364,11 +358,6 @@ Starsze snapshoty bez tego ustawienia zachowują jedno zapytanie naraz. Ogranicz
 współbieżności nie zastępuje limitu żądań na minutę; w razie błędów 429 zmniejsz tę wartość.
 [OpenAI Docs — limity i ponawianie](https://developers.openai.com/api/docs/guides/rate-limits).
 
-Dla lokalnego trybu ustaw `asr.provider: local`. Wtedy domyślnie używany jest wielojęzyczny
-`base` Q5_0 i dwa wątki. Pobierz model przez
-`docker compose run --rm -v ./models:/app/models bot model-download`.
-Lokalny model można zmienić przez `model_url` i `model_path`; nie używaj modeli `.en` dla polskiego.
-Zadania zapisane przed dodaniem API zachowują tryb lokalny i nie wymagają klucza OpenAI.
 Zadania przyjęte z modelem `whisper-1` również zachowują swój model. OpenAI zapowiada jego
 wyłączenie na **26 lutego 2027**: [harmonogram wyłączeń](https://developers.openai.com/api/docs/deprecations).
 
@@ -439,7 +428,7 @@ Pomiar polskiej próbki syntetycznej pod limitem zasobów:
 ```sh
 docker run --rm --memory=768m --memory-swap=768m --cpus=2 \
   --user "$(id -u):$(id -g)" \
-  -v "$PWD/models:/app/models:ro" -v "$PWD/data:/app/data" \
+  --env-file .env -v "$PWD/data:/app/data" \
   mattermost-rolki:test scripts/benchmark.py
 ```
 
@@ -448,9 +437,9 @@ RSS pojedynczego procesu potomnego, nie sumę pamięci całego kontenera; limit 
 cały kontener. Dla oceny jakości na ludzkiej mowie zamontuj własny plik i użyj `--source`.
 Próbka syntetyczna sprawdza działanie oraz zasoby, nie dowodzi jakości na docelowych filmach.
 Nie gwarantujemy czasu wykonania przed pomiarem prawdziwego materiału około 20 minut.
-Benchmark domyślnie używa `--provider local`, niezależnie od backendu w YAML.
-Próbę OpenAI uruchom przez `--provider openai`, przekazując klucz w `env_file` i używając
-osobnego, pustego katalogu `--output`. Taka próba wykonuje płatne zapytania API.
+Benchmark korzysta z API OpenAI i modelu ustawionego w YAML. Przekaż klucz przez
+`--env-file .env` i użyj osobnego, pustego katalogu `--output`.
+Taka próba wykonuje płatne zapytania API.
 
 ## Granice v1
 

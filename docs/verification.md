@@ -238,3 +238,13 @@ Zachowano niestandardowe ustawienia VPS-a i wykonano backup konfiguracji oraz SQ
 Nowy obraz przeszedł `check --integrations --tools`; bot i worker zostały odtworzone.
 Po restarcie `/healthz` potwierdził aktywne WebSocket, brak błędów powiadomień i zdrową
 aplikację. Aktywna konfiguracja ma włączone opisy i wskazany model; baza ma schemat 4.
+
+## Usunięcie lokalnego backendu ASR
+
+Transkrypcja korzysta wyłącznie z API OpenAI; domyślny model to `gpt-transcribe`.
+Usunięto kompilację i binarki whisper.cpp, pobieranie i kwantyzację lokalnych modeli,
+parser lokalnego JSON oraz montowanie katalogu `models` w Compose.
+Wcześniejsze sekcje opisujące whisper.cpp dokumentują historyczne pomiary.
+
+Weryfikacja lokalna (Python 3.12): **331 testów przeszło, 11 pominięto**.
+`ruff check .` i `git diff --check` zakończyły się powodzeniem.

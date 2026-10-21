@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import math
 import re
 import textwrap
@@ -8,7 +7,6 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .config import Subtitles, Video
-from .errors import PermanentError
 
 
 @dataclass(frozen=True)
@@ -34,73 +32,6 @@ def cue_from_dict(data: dict) -> Cue:
         data["text"],
         tuple(Word(**word) for word in data.get("words", ())),
     )
-
-
-def token_words(segment: dict, start: float, end: float, offset: float) -> tuple[Word, ...]:
-    """Join BPE subwords and punctuation, without inventing missing timestamps."""
-    groups: list[tuple[str, list[tuple[float, float]]]] = []
-    try:
-        for token in segment.get("tokens", []):
-            text = token["text"]
-            if re.fullmatch(r"\[_[^\]]*\]|<\|.*\|>", text) or not text:
-                continue
-            if text.isspace():
-                # Whitespace-only tokens delimit the next word.
-                groups.append(("", []))
-                continue
-            if len(text.split()) != 1:
-                return ()  # One token covering multiple words cannot time each word.
-            if text[0].isspace() or not groups:
-                groups.append(("", []))
-            word, times = groups[-1]
-            groups[-1] = (word + text.strip(), times)
-            # A comma/period may be timed at the end of a long pause: keep its text,
-            # but do not extend the spoken word's highlight through that pause.
-            if any(char.isalnum() for char in text):
-                first = float(token["offsets"]["from"]) / 1000
-                last = float(token["offsets"]["to"]) / 1000
-                if not (math.isfinite(first) and math.isfinite(last) and 0 <= first <= last):
-                    return ()
-                times.append((first, last))
-        groups = [(text, times) for text, times in groups if text]
-        if " ".join(text for text, _ in groups) != " ".join(segment["text"].split()):
-            return ()
-        result = []
-        previous_end = start
-        for text, times in groups:
-            if not times:
-                return ()
-            first = min(end, max(previous_end, min(t[0] for t in times)))
-            last = max(first, min(end, max(t[1] for t in times)))
-            result.append(Word(offset + first, offset + last, text))
-            previous_end = last
-        return tuple(result)
-    except (ValueError, KeyError, TypeError, IndexError, AttributeError):
-        # A valid phrase remains usable even if its optional token data is incomplete.
-        return ()
-
-
-def parse_whisper(path: Path, *, offset=0.0, duration: float) -> list[Cue]:
-    try:
-        document = json.loads(path.read_text(encoding="utf-8"))
-        cues = []
-        for segment in document["transcription"]:
-            first = float(segment["offsets"]["from"]) / 1000
-            last = float(segment["offsets"]["to"]) / 1000
-            if not (math.isfinite(first) and math.isfinite(last)):
-                raise ValueError("nonfinite timestamp")
-            start = max(0.0, first)
-            end = min(duration, last)
-            text = " ".join(segment["text"].split())
-            if text and end > start:
-                cues.append(
-                    Cue(
-                        offset + start, offset + end, text, token_words(segment, start, end, offset)
-                    )
-                )
-        return cues
-    except (ValueError, KeyError, TypeError) as exc:
-        raise PermanentError("Niepoprawny wynik transkrypcji whisper.cpp.") from exc
 
 
 def timed_phrases(cue: Cue, config: Subtitles, start: float) -> list[Cue]:

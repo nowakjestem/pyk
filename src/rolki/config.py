@@ -46,22 +46,14 @@ class Paths(Settings):
 
 
 class ASR(Settings):
-    # Keep local as the schema default for jobs saved before API support.
-    provider: Literal["local", "openai"] = "local"
-    model: Literal["whisper-1", "gpt-transcribe"] = "whisper-1"
+    provider: Literal["openai"] = "openai"
+    model: Literal["whisper-1", "gpt-transcribe"] = "gpt-transcribe"
     text_chunk_seconds: int = Field(default=8, ge=3, le=15)
     concurrency: int = Field(default=1, ge=1, le=8)
     prompt: str = Field(default="", max_length=1024)
     request_timeout_seconds: int = Field(default=300, ge=10, le=3600)
-    binary: str = "whisper-cli"
-    quantizer: str = "whisper-quantize"
-    model_path: Path = Path("models/ggml-base-q5_0.bin")
-    model_url: str = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin"
-    quantization: Literal["q5_0", "q5_1", "q8_0"] = "q5_0"
     language: str = "pl"
-    threads: int = Field(default=2, ge=1, le=4)
     max_chunk_seconds: int = Field(default=300, ge=30, le=600)
-    timeout_seconds: int = Field(default=7200, ge=30)
 
     @field_validator("language")
     @classmethod
@@ -69,11 +61,6 @@ class ASR(Settings):
         if not re.fullmatch(r"[a-z]{2,3}|auto", value):
             raise ValueError("language must be a language code or auto")
         return value
-
-    @field_validator("model_url")
-    @classmethod
-    def download_url(cls, value):
-        return validate_url(value)
 
 
 class Descriptions(Settings):
@@ -328,9 +315,7 @@ class Config(Settings):
             raise ValueError("Uzupełnij S3_BUCKET i S3_PUBLIC_BASE_URL.")
 
     def require_asr(self):
-        if (self.asr.provider == "openai" or self.descriptions.enabled) and not os.getenv(
-            "OPENAI_API_KEY", ""
-        ).strip():
+        if not os.getenv("OPENAI_API_KEY", "").strip():
             raise ValueError("Brak OPENAI_API_KEY w .env.")
 
     def require_buffer(self):
@@ -373,8 +358,4 @@ def load_config(path: Path | str = "config.yaml") -> Config:
         key: str((path.parent / value).resolve())
         for key, value in config.paths.model_dump().items()
     }
-    asr = config.asr.model_dump(mode="json")
-    asr["model_path"] = str((path.parent / config.asr.model_path).resolve())
-    return Config.model_validate(
-        {**json.loads(config.model_dump_json()), "paths": paths, "asr": asr}
-    )
+    return Config.model_validate({**json.loads(config.model_dump_json()), "paths": paths})

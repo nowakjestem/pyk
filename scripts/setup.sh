@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 cd "$(dirname "$0")/.."
-mkdir -p data models
+mkdir -p data
 if [ ! -f .env ]; then
   cp .env.example .env
   chmod 600 .env
