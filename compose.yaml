@@ -1,7 +1,7 @@
 name: mattermost-rolki
 
 x-common: &common
-  image: mattermost-rolki:local
+  image: ${PYK_IMAGE:-mattermost-rolki:local}
   build:
     context: .
     target: runtime

@@ -24,42 +24,28 @@ Integracja jest domyślnie wyłączona; wymaga klucza API Buffera i podłączeni
 Segmenty ponad 3 minuty dzielimy na możliwie równe części do 180 sekund, z napisem
 `part 1`, `part 2` itd. Jedna reakcja zatwierdza wszystkie części wybranego wariantu.
 
-## Uruchomienie na VPS
+## Obraz z GitHub Container Registry
 
-Repozytorium i wszystkie obrazy buduj w osobnym katalogu, np. `/home/nowak/mattermost-rolki`.
-`scripts/setup.sh` tworzy katalogi danych oraz `.env`, jeśli plik jeszcze nie istnieje,
-i ustawia UID/GID kontenerów na właściciela katalogu. Nie nadpisuje istniejącego `.env`.
+Workflow `.github/workflows/docker.yaml` buduje wspólny obraz bota i workera
+z etapu `runtime` (Linux amd64) i publikuje go jako `ghcr.io/nowakjestem/pyk`:
 
-```sh
-git clone git@github.com:nowakjestem/pyk.git /home/nowak/mattermost-rolki
-cd /home/nowak/mattermost-rolki
-sh scripts/setup.sh
-# Uzupełnij .env na serwerze.
-docker compose build
-docker compose run --rm bot check --integrations --tools
-docker compose up -d
-curl --fail http://127.0.0.1:8089/healthz
-```
+- push do `main`: tag `latest` i `sha-<pełny SHA commita>`;
+- push taga `v*`, np. `v1.2.3`: tag `v1.2.3` i `sha-<pełny SHA commita>`;
+- ręczne uruchomienie **Actions → Docker image → Run workflow**: tag SHA,
+  a na `main` także `latest`;
+- pull request do `main`: tylko sprawdzenie budowania, bez publikacji.
 
-### Aktualizacja przez Git
+Build korzysta z cache GitHub Actions. Publikacja działa niezależnie od workflow
+`tests`; zielony build obrazu nie oznacza zaliczenia testów aplikacji.
+CI loguje się automatycznie przez `GITHUB_TOKEN` z uprawnieniem `packages: write`;
+nie trzeba dodawać PAT ani innych sekretów do repozytorium.
+Nowy pakiet GHCR jest domyślnie **prywatny**, niezależnie od widoczności repozytorium.
+Jeżeli pakiet `pyk` już istnieje, sprawdź w jego **Package settings**, czy ma
+widoczność **Private** i czy repozytorium `nowakjestem/pyk` ma dostęp w
+**Manage Actions access**. Workflow nie zmienia widoczności istniejącego pakietu.
+Zasady dostępu opisuje [dokumentacja GHCR](https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-container-registry).
 
-Na `narcyzie` katalog `/home/nowak/mattermost-rolki` jest checkoutem gałęzi `main`.
-Po wypchnięciu zmian do GitHuba wdrażaj je w tym katalogu:
-
-```sh
-git pull --ff-only origin main
-docker build --target test -t pyk-tests .
-docker run --rm --memory=768m --memory-swap=768m --cpus=2 pyk-tests -m pytest -q
-docker compose build
-docker compose run --rm --no-deps bot check --integrations --tools
-docker compose up -d
-```
-
-Wykonuj następny krok dopiero po powodzeniu poprzedniego. Przy lokalnych zmianach Git
-zatrzyma aktualizację, zamiast nadpisywać konfigurację. `.env`, `data/`, `models/`,
-`fonts/`, `artifacts/` oraz `compose.override.yaml` są poza Gitem i pozostają na serwerze.
-Ustawienia środowiska trzymaj w `.env`, a własne mounty w `compose.override.yaml`.
-GitHub Actions uruchamia lint i testy na push oraz pull request; wdrożenie na VPS pozostaje ręczne.
+## Konfiguracja i działanie
 
 Bot ma limit 128 MiB; worker 768 MiB oraz 2 vCPU. Swap nie jest wymagany ani automatycznie
 tworzony. Jednocześnie działa jeden proces kosztownego etapu. Obie wersje klipu powstają
