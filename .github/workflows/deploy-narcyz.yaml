@@ -1,0 +1,105 @@
+name: Deploy Pyk to Narcyz
+
+on:
+  workflow_run:
+    workflows: [Docker image, tests]
+    branches: [main]
+    types: [completed]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+  packages: read
+
+concurrency:
+  group: pyk-production-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    if: >-
+      (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') ||
+      (github.event_name == 'workflow_run' &&
+       github.event.workflow_run.head_repository.full_name == github.repository &&
+       (github.event.workflow_run.event == 'push' || github.event.workflow_run.event == 'workflow_dispatch') &&
+       github.event.workflow_run.conclusion == 'success')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Require successful tests and published image for current main
+        id: gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          SOURCE_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+        run: |
+          set -eu
+          gh api "repos/$REPOSITORY/commits/main" --jq .sha > main-sha.txt
+          gh api "repos/$REPOSITORY/actions/runs?head_sha=$SOURCE_SHA&per_page=100" > runs.json
+          python3 - <<'PY'
+          import json, os, re
+          from pathlib import Path
+          sha = os.environ['SOURCE_SHA']
+          if not re.fullmatch(r'[0-9a-f]{40}', sha):
+              raise SystemExit('Invalid source SHA')
+          latest = {}
+          for run in json.loads(Path('runs.json').read_text())['workflow_runs']:
+              if run['head_sha'] != sha or run['head_branch'] != 'main' or run['event'] not in ('push', 'workflow_dispatch'):
+                  continue
+              latest.setdefault(run['path'], run)
+          required = ('.github/workflows/tests.yaml', '.github/workflows/docker.yaml')
+          ready = Path('main-sha.txt').read_text().strip() == sha and all(
+              path in latest and latest[path]['status'] == 'completed' and latest[path]['conclusion'] == 'success'
+              for path in required
+          )
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write(f'ready={str(ready).lower()}\nsha={sha}\n')
+          print('Tests and image successful for current main' if ready else 'No release: stale commit or tests/image not yet successful')
+          PY
+
+      - name: Check out infrastructure
+        if: steps.gate.outputs.ready == 'true'
+        uses: actions/checkout@9f698171ed81b15d1823a05fc7211befd50c8ae0 # v6.0.3
+        with:
+          repository: nowakjestem/narcyz-config
+          ref: main
+          ssh-key: ${{ secrets.NARCYZ_CONFIG_DEPLOY_KEY }}
+          path: infrastructure
+
+      - name: Log in to GHCR
+        if: steps.gate.outputs.ready == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ACTOR: ${{ github.actor }}
+        run: printf '%s' "$GH_TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin
+
+      - name: Pin the exact published image and push configuration
+        if: steps.gate.outputs.ready == 'true'
+        working-directory: infrastructure
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          SOURCE_SHA: ${{ steps.gate.outputs.sha }}
+        run: |
+          set -eu
+          image="ghcr.io/nowakjestem/pyk:sha-$SOURCE_SHA"
+          digest=$(docker buildx imagetools inspect "$image" --format '{{json .Manifest}}' | python3 -c 'import json,sys; print(json.load(sys.stdin)["digest"])')
+          python3 update_pyk_image.py "$digest"
+          if git diff --quiet -- services/pyk/docker-compose.yml; then
+            echo 'Pyk image already pinned; nothing to publish'
+            exit 0
+          fi
+          if [ "$(gh api "repos/$REPOSITORY/commits/main" --jq .sha)" != "$SOURCE_SHA" ]; then
+            echo 'Newer main commit exists; skipping stale release'
+            exit 0
+          fi
+          git config user.name 'pyk-release[bot]'
+          git config user.email 'pyk-release@users.noreply.github.com'
+          git add services/pyk/docker-compose.yml
+          git commit -m "Deploy pyk $SOURCE_SHA"
+          git push origin HEAD:main
+
+      - name: Clean up GHCR login
+        if: always() && steps.gate.outputs.ready == 'true'
+        run: docker logout ghcr.io
