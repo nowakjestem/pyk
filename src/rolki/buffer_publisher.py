@@ -15,7 +15,6 @@ from .buffer import (
     QueueFull,
     matches,
     post_input,
-    queue_fits_retention,
     remote_time,
 )
 from .buffer_store import BufferStore
@@ -32,17 +31,7 @@ async def reserve_plan(db, job, chapters, config):
     store = BufferStore(db)
     if all(store.plan(job["id"], c["index"]) for c in chapters):
         return
-    if config.buffer.scheduling_mode == "addToQueue":
-        store.reserve(job["id"], chapters, config.buffer, [])
-        return
-    config.require_buffer()
-    async with aiohttp.ClientSession(
-        trust_env=True, timeout=aiohttp.ClientTimeout(total=60)
-    ) as session:
-        client = BufferClient(session)
-        await client.verify_channels(config.buffer)
-        external = await client.posts(config.buffer)
-    store.reserve(job["id"], chapters, config.buffer, external)
+    store.reserve(job["id"], chapters, config.buffer, [])
 
 
 class BufferPublisher:
@@ -124,7 +113,7 @@ class BufferPublisher:
                 detail,
                 post_id=post["id"],
                 due_at=due,
-                retry_at=time.time() + 3600,
+                retry_at=0,
             )
         else:
             self.delivery_status(
@@ -135,93 +124,12 @@ class BufferPublisher:
                 post_id=post["id"],
             )
 
-    async def process(self, plan, config, external, now, channels=None, queue_limit=None):
+    async def process(self, plan, config, external, now):
         job_id, index = plan["job_id"], plan["chapter_index"]
         deliveries = self.store.deliveries(job_id, index)
         state = json.loads(plan["checkpoint"])
         result = state.get("results", {}).get(str(index), {})
         chapter = next((c for c in state.get("chapters", []) if c["index"] == index), None)
-        for d in deliveries:
-            if (
-                plan["immediate"]
-                and d["status"] in ("pending", "waiting_capacity")
-                and d["post_id"]
-            ):
-                post = next((p for p in external if p["id"] == d["post_id"]), None)
-                if not post:
-                    self.delivery_status(
-                        plan,
-                        d,
-                        "failed",
-                        "Wpis nie jest widoczny w Bufferze; nie utworzono duplikatu.",
-                    )
-                elif (
-                    post.get("status") in ("sent", "sending") or post.get("shareMode") == "shareNow"
-                ):
-                    # It may have started publishing between the reaction and this read.
-                    if d["request_json"]:
-                        request = json.loads(d["request_json"])
-                        if post.get("shareMode") == "shareNow":
-                            request["mode"] = "shareNow"
-                            request.pop("dueAt", None)
-                            self.delivery_status(
-                                plan, d, "pending", request_json=json.dumps(request)
-                            )
-                        self.record_post(plan, d, request, post)
-                elif post.get("status") != "scheduled":
-                    self.delivery_status(
-                        plan,
-                        d,
-                        "failed",
-                        "Wpisu nie można teraz przyspieszyć. Sprawdź jego stan w Bufferze.",
-                    )
-                else:
-                    expected = json.loads(d["request_json"]) if d["request_json"] else None
-                    if expected:
-                        expected["mode"] = (
-                            "addToQueue"  # Check identity/content, allow a moved date.
-                        )
-                    if (
-                        not expected
-                        or not matches(post, expected)
-                        or post.get("schedulingType") != "automatic"
-                    ):
-                        self.delivery_status(
-                            plan,
-                            d,
-                            "failed",
-                            "Treść lub tryb wpisu zmieniono w Bufferze; sprawdź go przed publikacją natychmiastową.",
-                        )
-                continue
-            if d["status"] in ("sending", "unknown") and d.get("request_json"):
-                request = json.loads(d["request_json"])
-                candidates = [
-                    p
-                    for p in external
-                    if matches(p, request) and (not d["post_id"] or p["id"] == d["post_id"])
-                ]
-                if len(candidates) == 1:
-                    self.record_post(plan, d, request, candidates[0])
-                elif d["status"] == "sending":
-                    self.delivery_status(
-                        plan,
-                        d,
-                        "unknown",
-                        "Wysyłka została przerwana. Sprawdź Buffer; ponowienie może utworzyć duplikat.",
-                    )
-            elif d["status"] == "scheduled":
-                post = next((p for p in external if p["id"] == d["post_id"]), None)
-                if post and d.get("request_json"):
-                    self.record_post(plan, d, json.loads(d["request_json"]), post)
-                elif post and post.get("status") in ("sent", "error"):
-                    self.delivery_status(plan, d, post["status"], due_at=remote_time(post))
-                elif not post:
-                    self.delivery_status(
-                        plan,
-                        d,
-                        "cancelled",
-                        "Wpis nie jest już widoczny w kolejce Buffera.",
-                    )
         pending = [
             d
             for d in self.store.deliveries(job_id, index)
@@ -255,7 +163,7 @@ class BufferPublisher:
         text = text or chapter["title"]
         for d in pending:
             if immediate and any(
-                row["part_index"] < d["part_index"] and row["status"] != "sent"
+                row["part_index"] < d["part_index"] and row["status"] not in ("scheduled", "sent")
                 for row in self.store.deliveries(job_id, index)
             ):
                 continue
@@ -283,21 +191,6 @@ class BufferPublisher:
                     unsent = [
                         row for row in group if row["status"] in ("pending", "waiting_capacity")
                     ]
-                    if queue_limit is not None and any(
-                        self.store.capacity_used(config.buffer, external, row["channel_id"])
-                        >= queue_limit
-                        for row in unsent
-                    ):
-                        for row in unsent:
-                            self.delivery_status(
-                                plan,
-                                row,
-                                "waiting_capacity",
-                                "Kolejka jednego z kont jest pełna; cały klip czeka na wspólny termin.",
-                                retry_at=now + config.buffer.status_poll_seconds,
-                            )
-                        blocked.add(part_index)
-                        continue
                     try:
                         part_times[part_index] = self.store.schedule_part(
                             job_id, index, part_index, config.buffer, external, now=now
@@ -342,32 +235,6 @@ class BufferPublisher:
                     raise PermanentError(
                         "Retencja S3 nie zapewnia dostępności filmu do terminu publikacji z zapasem."
                     )
-                used = self.store.capacity_used(config.buffer, external, target.id)
-                if not immediate and queue_limit is not None and used >= queue_limit:
-                    self.delivery_status(
-                        plan,
-                        d,
-                        "waiting_capacity",
-                        f"Kolejka Buffera pełna ({used}/{queue_limit}); klip pozostaje w Pyk i zostanie wysłany po zwolnieniu miejsca.",
-                        retry_at=now + config.buffer.status_poll_seconds,
-                    )
-                    continue
-                if not custom and not immediate:
-                    account = (channels or {}).get(target.id)
-                    if (
-                        not account
-                        or not account.get("timezone")
-                        or "postingSchedule" not in account
-                    ):
-                        raise PermanentError(
-                            "Buffer nie zwrócił harmonogramu konta; nie można sprawdzić retencji filmu."
-                        )
-                    if not queue_fits_retention(
-                        account, external, now=now, deadline=expires - margin
-                    ):
-                        raise PermanentError(
-                            "Brak slotu Buffera przed końcem retencji filmu z zapasem. Zmień harmonogram lub retencję S3."
-                        )
                 await self.check_media(media["url"])
                 request = post_input(
                     target,
@@ -453,98 +320,27 @@ class BufferPublisher:
 
     async def tick(self, *, now=None):
         now = time.time() if now is None else now
-        cache = {}
-        limits = {}
         for plan in sorted(
             self.store.plans(accepted=True),
             key=lambda p: (not p["immediate"], p["accepted_at"], p["job_id"], p["chapter_index"]),
         ):
             config = Config.model_validate_json(plan["config_json"])
             deliveries = self.store.deliveries(plan["job_id"], plan["chapter_index"])
-            actionable = any(
-                d["status"] in ("pending", "waiting_capacity")
-                and d["retry_at"] <= now
-                and not any(
-                    (plan["immediate"] or previous["channel_id"] == d["channel_id"])
-                    and previous["part_index"] < d["part_index"]
-                    and previous["status"]
-                    not in (("sent",) if plan["immediate"] else ("scheduled", "sent"))
-                    for previous in deliveries
-                )
-                for d in deliveries
-            )
-            refresh = any(
-                d["status"] in ("scheduled", "unknown", "sending") and d["retry_at"] <= now
-                for d in deliveries
-            )
-            result = (
-                json.loads(plan["checkpoint"])
-                .get("results", {})
-                .get(str(plan["chapter_index"]), {})
-            )
-            if not refresh and (
-                not actionable
-                or any(plan["variant"] not in clip.get("variants", {}) for clip in clips(result))
-                or (config.descriptions.enabled and "description" not in result)
-            ):
-                continue
-            cache_key = config.buffer.model_dump_json()
-            try:
-                if cache_key not in cache:
-                    channels = await self.client.verify_channels(config.buffer)
-                    cache[cache_key] = (channels, await self.client.posts(config.buffer))
-                if not plan["immediate"] and config.buffer.organization_id not in limits:
-                    limits[config.buffer.organization_id] = await self.client.queue_limit(
-                        config.buffer
+            for delivery in deliveries:
+                if delivery["status"] == "sending":
+                    self.delivery_status(
+                        plan,
+                        delivery,
+                        "unknown",
+                        "Wysyłka została przerwana. Sprawdź Buffer przed ręcznym ponowieniem.",
                     )
-                channels, external = cache[cache_key]
-                await self.process(
-                    plan, config, external, now, channels, limits.get(config.buffer.organization_id)
-                )
-                for d in self.store.deliveries(plan["job_id"], plan["chapter_index"]):
-                    if d["status"] in ("scheduled", "unknown"):
-                        self.delivery_status(
-                            plan,
-                            d,
-                            d["status"],
-                            d["detail"],
-                            retry_at=now
-                            + (
-                                config.buffer.poll_seconds
-                                if plan["immediate"]
-                                else config.buffer.status_poll_seconds
-                            ),
-                        )
-            except (PermanentError, TransientError) as exc:
-                log.warning("Buffer preflight failure_type=%s", type(exc).__name__)
-                for d in deliveries:
-                    if d["status"] == "waiting_capacity":
-                        self.delivery_status(
-                            plan,
-                            d,
-                            "failed" if isinstance(exc, PermanentError) else "waiting_capacity",
-                            str(exc),
-                            retry_at=now + config.buffer.status_poll_seconds,
-                        )
-                    elif d["status"] == "pending":
-                        attempts = d["attempts"] + 1
-                        terminal = isinstance(exc, PermanentError) or attempts >= 3
-                        self.delivery_status(
-                            plan,
-                            d,
-                            "failed" if terminal else "pending",
-                            str(exc),
-                            attempts=attempts,
-                            retry_at=now + max(getattr(exc, "retry_after", 0), 60),
-                        )
-                    elif d["status"] in ("unknown", "sending", "scheduled"):
-                        self.delivery_status(
-                            plan,
-                            d,
-                            d["status"],
-                            d["detail"],
-                            retry_at=now + config.buffer.status_poll_seconds,
-                        )
+            actionable = any(
+                delivery["status"] in ("pending", "waiting_capacity")
+                and delivery["retry_at"] <= now
+                for delivery in deliveries
+            )
+            if actionable:
+                await self.process(plan, config, [], now)
 
 
 async def run_publisher(config, db):

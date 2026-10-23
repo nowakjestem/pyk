@@ -176,7 +176,6 @@ async def async_main(args, config):
             )
         )
     elif args.command == "buffer-replan":
-        from .buffer import BufferClient
         from .buffer_store import BufferStore
 
         settings = Config.model_validate_json(db.get(args.id)["config_json"])
@@ -190,18 +189,12 @@ async def async_main(args, config):
         plans = [p for p in store.plans(accepted=False) if p["job_id"] == args.id]
         changed = 0
         if plans:
-            async with aiohttp.ClientSession(
-                trust_env=True, timeout=aiohttp.ClientTimeout(total=60)
-            ) as session:
-                client = BufferClient(session)
-                await client.verify_channels(settings.buffer)
-                external = await client.posts(settings.buffer)
             for plan in plans:
                 changed += store.move(
                     args.id,
                     plan["chapter_index"],
                     settings.buffer,
-                    external,
+                    [],
                     unapproved_only=True,
                     notice="Termin przeliczono na najbliższe 7 dni.",
                 )

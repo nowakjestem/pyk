@@ -28,8 +28,8 @@ dla wszystkich kont docelowych. Kolejne reakcje nie tworzą kolejnych publikacji
 Na już zatwierdzonym klipie ⚡ lub 🚀 przyspiesza publikację **wcześniej wybranego
 wariantu**, niezależnie od tego, które z tych dwóch emoji klikniesz.
 Reakcja na osobną wiadomość z opisem albo wiadomość źródłową nie uruchamia publikacji.
-Usunięcie reakcji nie anuluje wpisu. Anuluj go w Bufferze; Pyk synchronizuje status
-przy kolejnej kontroli, domyślnie co godzinę.
+Usunięcie reakcji nie anuluje wpisu. Anuluj go w Bufferze. Pyk nie synchronizuje
+późniejszych zmian statusów ani usunięć.
 
 ## Publikacja natychmiastowa
 
@@ -42,18 +42,14 @@ i platformy mogą narzucić własne limity albo czas przetwarzania; nie jest to 
 publikacji dokładnie w tej samej sekundzie.
 
 Jeśli wpisy już istnieją, Pyk używa `editPost(mode: shareNow)` z ich zapisanymi ID,
-zamiast tworzyć nowe. Zachowuje wybrany wariant, nie publikuje ponownie wysłanych
-materiałów i nie odtwarza wpisów usuniętych lub zmienionych ręcznie w Bufferze.
-Ręczne przesunięcie samej daty nie blokuje przyspieszenia. Gdy wcześniejsza wysyłka
-ma nieznany wynik albo nadal trwa, trzeba najpierw wyjaśnić jej stan. Timeout po
-przyspieszeniu powoduje synchronizację; nie wywołuje ponownej mutacji w ciemno.
+zamiast tworzyć nowe. Nie odczytuje wcześniej stanu ani treści wpisów w Bufferze.
+Timeout lub restart podczas wysyłki pozostawia wynik nieznany i wymaga ręcznego
+sprawdzenia w Bufferze przed ponowieniem.
 
-Przy podzielonym rozdziale reakcja dotyczy wszystkich jego części. Pierwsza jest
-publikowana od razu; każda następna dopiero po potwierdzeniu publikacji poprzedniej
-na wszystkich kontach, bez zwykłego odstępu 3 godzin. Statusy tego trybu są odczytywane
-co `poll_seconds`, domyślnie 30 sekund. Brak potwierdzenia lub błąd wcześniejszej
-części zatrzymuje kolejne. Mattermost pokazuje „publikacja zlecona”, a po potwierdzeniu
-przez Buffer — „opublikowano”.
+Przy podzielonym rozdziale kolejne części są wysyłane po przyjęciu zlecenia
+poprzedniej części na wszystkich kontach. Pyk nie czeka na faktyczną publikację.
+Mattermost pokazuje wynik odpowiedzi na zapis, np. „publikacja zlecona”; nie jest to
+potwierdzenie późniejszego opublikowania materiału na platformie.
 
 ## Konfiguracja
 
@@ -145,33 +141,19 @@ lokalnej kolejki i obsługę nowych reakcji, ale nie anuluje wpisów już przyj�
 
 ## Terminy i limity
 
-Limit kolejki jest odczytywany z API organizacji Buffera, a nie wpisany na sztywno.
-W planie Free to [10 zaplanowanych materiałów na każde konto](https://buffer.com/pricing),
-łącznie z wpisami dodanymi ręcznie. Każda część segmentu zajmuje jedno miejsce.
-Pyk liczy wpisy zaplanowane, wysyłane i oczekujące na akceptację oraz rezerwuje
-miejsce dla wysyłek o nieznanym wyniku, których API może jeszcze nie pokazywać.
-Robocze szkice i opublikowane materiały nie zajmują miejsc w tej kontroli.
-
-Po zapełnieniu kolejki zatwierdzony klip pozostaje w SQLite ze statusem
-`waiting_capacity`; Mattermost pokazuje „czeka na wolne miejsce w Bufferze”.
-Pyk sprawdza dostępność ponownie co `status_poll_seconds` (domyślnie godzinę), także
-po restarcie. Publikacja lub usunięcie wpisu zwalnia miejsce, a Pyk wysyła kolejny
-materiał bez ponownej reakcji. W `customScheduled` Pyk sprawdza pojemność wszystkich
-kont przed pierwszą wysyłką danej części: pełne konto wstrzymuje cały klip.
-Jeśli żadne konto nie przyjęło jeszcze klipu, przeterminowaną datę można wyznaczyć
-ponownie dla całej grupy. Po przyjęciu wpisu przez choć jedno konto pozostałe
-zachowują tę samą datę; gdy minie, otrzymują błąd wymagający sprawdzenia w Bufferze.
-Jednoznaczna odpowiedź API `LimitReachedError`, np. po równoległym dodaniu wpisu
-w UI, również powoduje oczekiwanie, bez wyczerpywania trzech prób wysyłki.
-Pozostałe błędy i nieznane wyniki zachowują dotychczasową obsługę.
-Przed wznowieniem nadal sprawdzamy dostępność filmu do terminu publikacji;
-zbyt długie oczekiwanie może wymagać ponownego przygotowania wygasłego pliku.
-Wysyłki już zakończone błędem w starszej wersji wymagają `buffer-retry`.
+Pyk nie pobiera limitu kolejki ani jej zawartości. O przyjęciu lub odrzuceniu
+wysyłki decyduje odpowiedź Buffera na `createPost` lub `editPost`.
+Jednoznaczny `LimitReachedError` pozostawia aktywne zlecenie jako `waiting_capacity`.
+Ponowienie zapisu następuje co `status_poll_seconds` (domyślnie godzinę), a dla
+publikacji natychmiastowej co `poll_seconds`. Nie towarzyszą mu odczyty API.
+Przed ponowieniem nadal sprawdzana jest dostępność i retencja pliku.
+Po przyjęciu wpisu przez choć jedno konto wspólna data pozostaje stała.
 
 W `customScheduled` Pyk wybiera wspólną minutę w ciągu najbliższych 168 godzin,
 w godzinach `schedule.window_start`–`window_end`, z uwzględnieniem strefy czasowej,
 minimalnego wyprzedzenia, odstępów i dziennego limitu na każdym koncie. Uwzględnia
-też istniejące wpisy Buffera oraz rezerwacje innych klipów i części. Termin zapisuje
+wyłącznie lokalne rezerwacje innych klipów i części. Wpisy dodane ręcznie
+w Bufferze nie są uwzględniane. Termin zapisuje
 w SQLite przed wysyłką. Restart i ponowienie błędu nie zmieniają daty przyjętych wpisów.
 `buffer-replan ID_ZADANIA` przelicza tylko niezatwierdzone propozycje.
 
@@ -220,14 +202,10 @@ na potrzeby kontroli retencji. Nie zmienia polityki lifecycle bucketa. Wymagana
 jest publiczna dostępność HTTPS i rzeczywista retencja zgodna z YAML; wygasające
 presigned URL nie nadają się do tej integracji.
 
-W `addToQueue` przed wysyłką Pyk sprawdza harmonogram konta i kolejkę: musi istnieć slot przed
-końcem retencji z zapasem, również po ostatnim obecnie zaplanowanym wpisie.
-To ostrożna kontrola dostępności, nie samodzielne wyznaczanie daty publikacji.
-Brak slotów lub zbyt długa kolejka powodują błąd konkretnej części/konta.
-Nie ma transakcji obejmującej odczyt i zapis Buffera: jeśli rzeczywisty zwrócony
-termin albo późniejsze ręczne przesunięcie przekracza retencję, wiadomość pokazuje
-ostrzeżenie. Przyspiesz wtedy wpis w Bufferze lub zapewnij dłuższą dostępność pliku.
-Pyk nie usuwa przyjętego wpisu i nie tworzy go ponownie.
+W `addToQueue` Pyk nie pobiera harmonogramu ani kolejki. Sprawdza lokalną retencję
+pliku i termin zwrócony w odpowiedzi na zapis. Jeśli zwrócony termin przekracza
+retencję, wiadomość pokazuje ostrzeżenie. Późniejsze ręczne przesunięcia nie są
+wykrywane. Pyk nie usuwa przyjętego wpisu i nie tworzy go ponownie.
 W `customScheduled` kontrola retencji porównuje dostępność pliku bezpośrednio
 ze wspólną datą klipu. API nie zapewnia transakcji obejmującej wszystkie konta:
 błąd platformy lub zapełnienie kolejki przez równoległy wpis może pozostawić częściowy
@@ -241,19 +219,17 @@ Wiadomość z linkami pokazuje wybrany wariant, datę i wynik per konto:
 - wysyłanie — trwa tworzenie wpisu;
 - zaplanowano — Buffer potwierdził automatyczny wpis z filmem i terminem;
 - publikacja zlecona — Buffer przyjął publikację natychmiastową, trwa jej obsługa;
-- opublikowano / błąd publikacji — wynik odczytany z Buffera;
+- opublikowano / błąd publikacji — tylko jeśli taki wynik zwróci od razu zapis do Buffera;
 - wynik nieznany — operacja mogła się udać; Pyk nie powtarza jej w ciemno;
 - błąd — jednoznaczna odmowa, niezgodny format, retencja lub wyczerpane próby;
-- usunięto w Bufferze — wcześniej znany wpis nie jest widoczny przy synchronizacji.
+Późniejsze statusy publikacji i usunięcia sprawdzaj bezpośrednio w Bufferze.
 
 HTTP 200 nie jest dowodem sukcesu GraphQL. Klient sprawdza błędy w treści odpowiedzi,
 potwierdzony tryb `automatic`, stan, film, opis i termin. Nie przełącza się na
 przypomnienia. Przy 429 respektuje `Retry-After`; jednoznacznie nieudane próby są
 ograniczone do trzech. Buffer nie dokumentuje idempotencji `createPost`. Timeout,
-niejednoznaczny błąd serwera albo restart podczas wysyłki powoduje odczyt kalendarza
-i próbę znalezienia unikalnego wpisu po koncie, tekście i URL konkretnej części
-(oraz terminie dla starych żądań `customScheduled`). Brak wpisu w jednym
-odczycie nie powoduje automatycznej ponownej mutacji.
+niejednoznaczny błąd serwera albo restart podczas wysyłki pozostawia `unknown`.
+Pyk nie próbuje odczytywać wpisów ani automatycznie ponawiać nieznanego zapisu.
 
 ```sh
 docker compose run --rm --no-deps bot buffer-queue
@@ -274,12 +250,14 @@ jednoznacznie nieudane przyspieszenie (`failed`): `buffer-retry` ponawia wtedy
 Przy podzielonym segmencie dodaj `--part 2`, aby ponowić drugą część; domyślnie
 polecenie dotyczy pierwszej części. Kolejne oczekujące części ruszą po jej przyjęciu.
 Anulowanie lub zmianę wariantu po zatwierdzeniu wykonuje się świadomie w Bufferze;
-zmiany zdalne mogą spowodować stan `unknown`, wymagający sprawdzenia.
+zmiany zdalne nie są synchronizowane do Pyk.
 
-Limity API zależą od planu. Statusy zwykłej kolejki są odczytywane godzinowo,
-a natychmiastowej co `poll_seconds`. Oczekiwanie na opis
-nie powoduje zapytań do Buffera. Duża liczba postów i paginacja mogą zwiększyć liczbę
-odczytów; w razie limitów zwiększ `status_poll_seconds`.
+Integracja nie monitoruje Buffera. Bez aktywnego zlecenia wysyłki nie wykonuje
+żadnych requestów do jego API, również po restarcie. Planowanie i `buffer-replan`
+korzystają z SQLite. Wysyłka wykonuje wyłącznie `createPost` lub `editPost`, po jednym
+żądaniu na część i konto (z ewentualnymi ponowieniami jednoznacznej odmowy).
+`poll_seconds` steruje sprawdzaniem lokalnych zleceń, a nie odpytywaniem Buffera.
+Ręczne polecenia `buffer-accounts` i `check --integrations` nadal odczytują API.
 
 ## Weryfikacja
 

@@ -270,13 +270,13 @@ class FakeClient:
         }
 
     async def verify_channels(self, _settings):
-        return self.accounts
+        raise AssertionError("Automatyczny odczyt kont Buffera")
 
     async def queue_limit(self, _settings):
-        return self.limit
+        raise AssertionError("Automatyczny odczyt limitu Buffera")
 
     async def posts(self, _settings):
-        return [dict(p) for p in self.remote]
+        raise AssertionError("Automatyczny odczyt postów Buffera")
 
     async def create(self, request):
         self.created.append(request)
@@ -319,6 +319,40 @@ def publisher(db, monkeypatch):
 
     monkeypatch.setattr(p, "check_media", media)
     return p, client
+
+
+@pytest.mark.parametrize("immediate", [False, True])
+@pytest.mark.parametrize("status", ["scheduled", "sent", "error", "unknown", "sending", "failed"])
+async def test_idle_publisher_never_contacts_buffer(
+    db, buffer_config, monkeypatch, immediate, status
+):
+    job_id = prepare(db, buffer_config, approve=False)
+    store = BufferStore(db)
+    store.accept(f"clip-{job_id}-0", "zap" if immediate else "scissors", "member")
+    for delivery in store.deliveries(job_id, 0):
+        store.status(job_id, 0, delivery["channel_id"], status, retry_at=0)
+    client = object()
+    for offset in (0, 30, 3600, 86400, 30 * 86400):
+        await BufferPublisher(db, client).tick(now=NOW.timestamp() + offset)
+    expected = "unknown" if status == "sending" else status
+    assert all(delivery["status"] == expected for delivery in store.deliveries(job_id, 0))
+
+
+async def test_reserve_plan_does_not_contact_buffer(db, buffer_config, monkeypatch):
+    from rolki.buffer_publisher import reserve_plan
+
+    job_id = prepare(db, buffer_config, approve=False)
+    with db.connect() as connection:
+        connection.execute("DELETE FROM buffer_plans WHERE job_id=?", (job_id,))
+    job = db.get(job_id)
+    chapters = json.loads(job["checkpoint"])["chapters"]
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("Planowanie nie może kontaktować się z Bufferem")
+
+    monkeypatch.setattr("rolki.buffer_publisher.BufferClient", forbidden)
+    await reserve_plan(db, job, chapters, buffer_config)
+    assert BufferStore(db).plan(job_id, 0)
 
 
 async def test_three_platforms_restart_and_variant(db, buffer_config, monkeypatch):
@@ -369,28 +403,21 @@ async def test_immediate_reaction_bypasses_schedule_and_full_queue(
     assert len(client.created) == 3
 
 
-async def test_immediate_parts_wait_for_previous_publication_on_all_accounts(
-    db, buffer_config, monkeypatch
-):
+async def test_immediate_parts_continue_after_write_acknowledgement(db, buffer_config, monkeypatch):
     job_id = prepare(db, buffer_config, approve=False)
     add_parts(db, job_id)
     store = BufferStore(db)
     assert store.accept(f"clip-{job_id}-0", "zap", "member")
     p, client = publisher(db, monkeypatch)
     await p.tick(now=NOW.timestamp())
-    assert len(client.created) == 3
-    client.remote[0]["status"] = "sent"
-    await p.tick(now=NOW.timestamp() + 31)
-    assert len(client.created) == 3
-    for post in client.remote:
-        post["status"] = "sent"
-    await p.tick(now=NOW.timestamp() + 62)
     assert len(client.created) == 6
     assert all(r["mode"] == "shareNow" for r in client.created)
     assert all("part 2" in r["text"] for r in client.created[3:])
+    await p.tick(now=NOW.timestamp() + 86400)
+    assert len(client.created) == 6
 
 
-async def test_immediate_create_restart_reconciles_without_duplicate(
+async def test_immediate_create_restart_leaves_unknown_without_duplicate(
     db, buffer_config, monkeypatch
 ):
     job_id = prepare(db, buffer_config, approve=False)
@@ -409,7 +436,11 @@ async def test_immediate_create_restart_reconciles_without_duplicate(
     client.create = create
     await p.tick(now=NOW.timestamp() + 31)
     assert len(client.created) == 3
-    assert all(d["status"] == "scheduled" for d in store.deliveries(job_id, 0))
+    assert [d["status"] for d in store.deliveries(job_id, 0)] == [
+        "unknown",
+        "scheduled",
+        "scheduled",
+    ]
 
 
 @pytest.mark.parametrize("reconnect", [False, True])
@@ -438,7 +469,9 @@ async def test_immediate_promotes_existing_posts_without_changing_variant_or_cre
     assert len(client.edited) == 3
 
 
-async def test_immediate_edit_restart_reconciles_existing_id(db, buffer_config, monkeypatch):
+async def test_immediate_edit_restart_leaves_unknown_without_duplicate(
+    db, buffer_config, monkeypatch
+):
     job_id = prepare(db, buffer_config)
     p, client = publisher(db, monkeypatch)
     await p.tick(now=NOW.timestamp())
@@ -455,7 +488,11 @@ async def test_immediate_edit_restart_reconciles_existing_id(db, buffer_config, 
     client.publish_now = publish_now
     await p.tick(now=NOW.timestamp() + 62)
     assert len(client.created) == 3 and len(client.edited) == 3
-    assert all(d["status"] == "scheduled" for d in p.store.deliveries(job_id, 0))
+    assert [d["status"] for d in p.store.deliveries(job_id, 0)] == [
+        "unknown",
+        "scheduled",
+        "scheduled",
+    ]
 
 
 async def test_immediate_reaction_during_scheduled_delivery_switches_remaining_requests(
@@ -480,30 +517,29 @@ async def test_immediate_reaction_during_scheduled_delivery_switches_remaining_r
     assert all(post["shareMode"] == "shareNow" for post in client.remote)
 
 
-async def test_immediate_does_not_recreate_missing_remote_or_republish_sent_post(
+async def test_immediate_edits_saved_ids_without_reading_remote_posts(
     db, buffer_config, monkeypatch
 ):
     job_id = prepare(db, buffer_config)
     p, client = publisher(db, monkeypatch)
     await p.tick(now=NOW.timestamp())
-    client.remote.pop(0)
-    client.remote[0]["status"] = "sent"
+    ids = [post["id"] for post in client.remote]
     p.store.accept(f"clip-{job_id}-0", "zap", "member")
     await p.tick(now=NOW.timestamp() + 31)
-    assert len(client.created) == 3 and len(client.edited) == 1
-    assert [d["status"] for d in p.store.deliveries(job_id, 0)] == ["failed", "sent", "scheduled"]
+    assert client.edited == ids
+    assert len(client.created) == 3
 
 
-async def test_immediate_refuses_manually_changed_content(db, buffer_config, monkeypatch):
+async def test_immediate_does_not_inspect_remote_content(db, buffer_config, monkeypatch):
     job_id = prepare(db, buffer_config)
     p, client = publisher(db, monkeypatch)
     await p.tick(now=NOW.timestamp())
     client.remote[0]["text"] = "Zmieniona treść"
-    client.remote[1]["dueAt"] = (NOW + timedelta(days=3)).isoformat()
     p.store.accept(f"clip-{job_id}-0", "zap", "member")
     await p.tick(now=NOW.timestamp() + 31)
-    assert len(client.created) == 3 and len(client.edited) == 2
-    assert p.store.deliveries(job_id, 0)[0]["status"] == "failed"
+    assert len(client.edited) == 3
+    assert len(client.created) == 3
+    assert p.store.deliveries(job_id, 0)[0]["status"] == "unknown"
 
 
 async def test_immediate_edit_lost_response_never_repeats_mutation(db, buffer_config, monkeypatch):
@@ -654,98 +690,65 @@ async def test_native_queue_uses_actual_different_dates_beyond_seven_days(
         NOW.timestamp() + 16 * 86400, UTC
     ).isoformat()
     await p.tick(now=NOW.timestamp() + 4000)
-    assert store.deliveries(job_id, 0)[0]["due_at"] == NOW.timestamp() + 16 * 86400
-    assert "25.10.2026" in store.message(job_id, 0)
+    assert store.deliveries(job_id, 0)[0]["due_at"] == NOW.timestamp() + 10 * 86400
+    assert "19.10.2026" in store.message(job_id, 0)
     assert len(client.created) == 3
 
 
-async def test_capacity_ten_per_channel_waits_and_refills_without_new_approval(
-    db, queue_config, monkeypatch
-):
+async def test_capacity_rejection_comes_from_write_response(db, queue_config, monkeypatch):
     job_id = prepare(db, queue_config, count=12)
     p, client = publisher(db, monkeypatch)
-    await p.tick(now=NOW.timestamp())
-    assert len(client.created) == 30
-    for channel in ("ig", "tt", "yt"):
-        assert sum(r["channelId"] == channel for r in client.created) == 10
-        waiting = [
-            d
-            for index in range(12)
-            for d in p.store.deliveries(job_id, index)
-            if d["channel_id"] == channel and d["status"] == "waiting_capacity"
-        ]
-        assert len(waiting) == 2 and all(d["attempts"] == 0 for d in waiting)
-    assert "czeka na wolne miejsce" in p.store.message(job_id, 11)
-    restarted = BufferPublisher(db, client)
-    monkeypatch.setattr(restarted, "check_media", p.check_media)
-    await restarted.tick(now=NOW.timestamp() + 30)
-    assert len(client.created) == 30
-    for channel in ("ig", "tt", "yt"):
-        published = [post for post in client.remote if post["channelId"] == channel][:2]
-        for post in published:
-            post["status"] = "sent"
-    await restarted.tick(now=NOW.timestamp() + 3601)
-    assert len(client.created) == 36
-    assert all(
-        d["status"] in ("scheduled", "sent")
-        for index in range(12)
-        for d in p.store.deliveries(job_id, index)
-    )
-    assert all(
-        sum(
-            post["channelId"] == channel and post["status"] == "scheduled" for post in client.remote
+    client.failure = lambda request: (
+        QueueFull("Limit")
+        if sum(
+            post["channelId"] == request["channelId"] and post["status"] == "scheduled"
+            for post in client.remote
         )
-        == 10
-        for channel in ("ig", "tt", "yt")
+        >= 10
+        else None
     )
+    await p.tick(now=NOW.timestamp())
+    assert len(client.remote) == 30
+    assert all(d["status"] == "waiting_capacity" for d in p.store.deliveries(job_id, 11))
+    writes = len(client.created)
+    await p.tick(now=NOW.timestamp() + 30)
+    assert len(client.created) == writes
+    for post in client.remote[:6]:
+        post["status"] = "sent"
+    await p.tick(now=NOW.timestamp() + 3601)
+    assert all(d["status"] == "scheduled" for d in p.store.deliveries(job_id, 11))
 
 
-async def test_capacity_counts_manual_posts_and_parts_but_platforms_are_independent(
-    db, queue_config, monkeypatch
-):
+async def test_capacity_rejection_only_blocks_affected_account(db, queue_config, monkeypatch):
     job_id = prepare(db, queue_config, approve=False)
     add_parts(db, job_id)
     store = BufferStore(db)
     store.accept(f"clip-{job_id}-0", "scissors", "member")
     p, client = publisher(db, monkeypatch)
-    for n in range(9):
-        client.remote.append(
-            {
-                "id": f"manual-{n}",
-                "channelId": "ig",
-                "status": "scheduled",
-                "dueAt": (NOW + timedelta(days=1)).isoformat(),
-            }
-        )
-    client.remote += [
-        {"id": "draft", "channelId": "ig", "status": "draft"},
-        {"id": "old", "channelId": "ig", "status": "sent"},
-    ]
+    client.failure = lambda request: QueueFull("Limit") if request["channelId"] == "ig" else None
     await p.tick(now=NOW.timestamp())
-    assert len(client.created) == 5
-    instagram = [d for d in store.deliveries(job_id, 0) if d["channel_id"] == "ig"]
-    assert [d["status"] for d in instagram] == ["scheduled", "waiting_capacity"]
+    assert [d["status"] for d in store.deliveries(job_id, 0) if d["channel_id"] == "ig"] == [
+        "waiting_capacity",
+        "pending",
+    ]
     assert all(
         d["status"] == "scheduled" for d in store.deliveries(job_id, 0) if d["channel_id"] != "ig"
     )
-    client.remote = [post for post in client.remote if post["id"] != "manual-0"]
+    client.failure = None
     await p.tick(now=NOW.timestamp() + 3601)
-    assert len(client.created) == 6
     assert all(d["status"] == "scheduled" for d in store.deliveries(job_id, 0))
 
 
-async def test_unknown_write_reserves_capacity_even_when_missing_from_api(
-    db, queue_config, monkeypatch
-):
-    first = prepare(db, queue_config)
-    second = prepare(db, queue_config, post="second")
+async def test_unknown_write_is_not_retried_or_monitored(db, queue_config, monkeypatch):
+    job_id = prepare(db, queue_config)
     p, client = publisher(db, monkeypatch)
-    client.limit = 1
     client.failure = lambda _request: AmbiguousResult("Utracono odpowiedź")
     await p.tick(now=NOW.timestamp())
     assert len(client.created) == 3
-    assert all(d["status"] == "unknown" for d in p.store.deliveries(first, 0))
-    assert all(d["status"] == "waiting_capacity" for d in p.store.deliveries(second, 0))
+    for offset in (30, 3601, 86400, 30 * 86400):
+        await BufferPublisher(db, client).tick(now=NOW.timestamp() + offset)
+    assert len(client.created) == 3
+    assert all(d["status"] == "unknown" for d in p.store.deliveries(job_id, 0))
 
 
 async def test_definitive_limit_race_waits_beyond_three_checks_and_uses_api_limit(
@@ -858,8 +861,11 @@ async def test_native_queue_retention_and_empty_schedule_do_not_create(
                 }
             )
     await p.tick(now=NOW.timestamp())
-    assert not client.created
-    assert all(d["status"] == "failed" for d in p.store.deliveries(job_id, 0))
+    assert len(client.created) == (0 if problem == "expired" else 3)
+    assert all(
+        d["status"] == ("failed" if problem == "expired" else "scheduled")
+        for d in p.store.deliveries(job_id, 0)
+    )
 
 
 def test_retention_uses_channel_timezone_and_dst():
@@ -960,28 +966,18 @@ async def test_custom_parts_share_timestamp_across_platforms(db, buffer_config, 
     assert len(client.created) == 6
 
 
-async def test_custom_full_account_holds_whole_clip_and_replans_after_wait(
-    db, buffer_config, monkeypatch
-):
+async def test_custom_capacity_rejection_holds_remaining_accounts(db, buffer_config, monkeypatch):
     job_id = prepare(db, buffer_config)
     p, client = publisher(db, monkeypatch)
-    client.limit = 1
-    client.remote.append(
-        {
-            "id": "manual",
-            "channelId": "tt",
-            "status": "scheduled",
-            "dueAt": (NOW + timedelta(hours=1)).isoformat(),
-        }
-    )
+    client.failure = lambda _request: QueueFull("Limit")
     await p.tick(now=NOW.timestamp())
-    assert not client.created
+    assert len(client.created) == 1
     assert all(d["status"] == "waiting_capacity" for d in p.store.deliveries(job_id, 0))
-    client.remote.clear()
+    client.failure = None
     later = NOW.timestamp() + 8 * 86400
     await p.tick(now=later)
-    assert len(client.created) == 3
-    assert len({r["dueAt"] for r in client.created}) == 1
+    assert len(client.remote) == 3
+    assert len({post["dueAt"] for post in client.remote}) == 1
     assert p.store.plan(job_id, 0)["due_at"] > later
 
 
@@ -1043,7 +1039,7 @@ async def test_custom_capacity_race_stops_remaining_accounts(db, buffer_config, 
     assert len({r["dueAt"] for r in client.created}) == 1
 
 
-async def test_custom_parts_restart_after_remote_write_preserves_times(
+async def test_custom_parts_restart_leaves_unknown_and_blocks_later_parts(
     db, buffer_config, monkeypatch
 ):
     job_id = prepare(db, buffer_config, approve=False)
@@ -1064,10 +1060,8 @@ async def test_custom_parts_restart_after_remote_write_preserves_times(
     restarted = BufferPublisher(db, client)
     monkeypatch.setattr(restarted, "check_media", p.check_media)
     await restarted.tick(now=NOW.timestamp() + 30)
-    assert len(client.created) == 6
-    assert len({r["dueAt"] for r in client.created[:3]}) == 1
-    assert len({r["dueAt"] for r in client.created[3:]}) == 1
-    assert all(d["status"] == "scheduled" for d in store.deliveries(job_id, 0))
+    assert len(client.created) == 1
+    assert store.deliveries(job_id, 0)[0]["status"] == "unknown"
 
 
 @pytest.mark.parametrize("ambiguous", [False, True])
@@ -1102,7 +1096,9 @@ async def test_first_part_failure_blocks_later_only_on_that_account(
     assert all(d["status"] == "scheduled" for d in store.deliveries(job_id, 0))
 
 
-async def test_queue_restart_reconciles_without_requested_timestamp(db, queue_config, monkeypatch):
+async def test_queue_restart_leaves_unknown_without_requested_timestamp(
+    db, queue_config, monkeypatch
+):
     job_id = prepare(db, queue_config, approve=False)
     add_parts(db, job_id)
     store = BufferStore(db)
@@ -1119,8 +1115,8 @@ async def test_queue_restart_reconciles_without_requested_timestamp(db, queue_co
         await p.tick(now=NOW.timestamp())
     client.create = create
     await p.tick(now=NOW.timestamp() + 30)
-    assert len(client.created) == 6
-    assert all(d["status"] == "scheduled" for d in store.deliveries(job_id, 0))
+    assert len(client.created) == 5
+    assert store.deliveries(job_id, 0)[0]["status"] == "unknown"
 
 
 def test_upgrade_v5_preserves_known_deliveries_and_refreshes_only_unused_plans(db, queue_config):
@@ -1172,7 +1168,7 @@ async def test_partial_success_only_retries_failed_account(db, buffer_config, mo
     assert [r["channelId"] for r in client.created] == ["ig", "tt", "yt", "tt"]
 
 
-async def test_ambiguous_never_recreates_and_can_reconcile(db, buffer_config, monkeypatch):
+async def test_ambiguous_never_recreates_or_reconciles(db, buffer_config, monkeypatch):
     job_id = prepare(db, buffer_config)
     p, client = publisher(db, monkeypatch)
     client.failure = lambda r: (
@@ -1197,7 +1193,8 @@ async def test_ambiguous_never_recreates_and_can_reconcile(db, buffer_config, mo
         }
     )
     await p.tick(now=NOW.timestamp() + 8000)
-    assert p.store.deliveries(job_id, 0)[0]["post_id"] == "lost-response"
+    assert p.store.deliveries(job_id, 0)[0]["post_id"] is None
+    assert p.store.deliveries(job_id, 0)[0]["status"] == "unknown"
     assert len(client.created) == 3
 
 
@@ -1221,7 +1218,9 @@ async def test_video_duration_limit_accounts_for_removed_intro(db, buffer_config
     state = json.loads(db.get(job_id)["checkpoint"])
     state["chapters"][0].update(start=10, end=191)
     state["results"]["0"]["intro"] = {
-        "start": 11.73, "removed_seconds": 1.73, "reason": "title_removed",
+        "start": 11.73,
+        "removed_seconds": 1.73,
+        "reason": "title_removed",
     }
     db.checkpoint(job_id, "uploaded", state)
     p, client = publisher(db, monkeypatch)
@@ -1584,11 +1583,15 @@ async def test_restart_after_remote_success_before_ack(db, buffer_config, monkey
     assert p.store.deliveries(job_id, 0)[0]["status"] == "sending"
     client.create = create
     await p.tick(now=NOW.timestamp() + 30)
-    assert len(client.created) == 3
-    assert all(d["status"] == "scheduled" for d in p.store.deliveries(job_id, 0))
+    assert len(client.created) == 1
+    assert [d["status"] for d in p.store.deliveries(job_id, 0)] == [
+        "unknown",
+        "pending",
+        "pending",
+    ]
 
 
-async def test_new_manual_post_collision_replans(db, buffer_config, monkeypatch):
+async def test_manual_posts_are_not_read_during_local_planning(db, buffer_config, monkeypatch):
     job_id = prepare(db, buffer_config)
     p, client = publisher(db, monkeypatch)
     due = p.store.plan(job_id, 0)["due_at"]
@@ -1601,8 +1604,7 @@ async def test_new_manual_post_collision_replans(db, buffer_config, monkeypatch)
     client.remote.append(manual)
     await p.tick(now=NOW.timestamp())
     moved = p.store.plan(job_id, 0)["due_at"]
-    assert moved != due
-    assert abs(moved - due) >= 180 * 60
+    assert moved == due
     assert len(client.created) == 3
 
 
