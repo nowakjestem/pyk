@@ -1,6 +1,7 @@
 import shutil
 import subprocess
 import wave
+import zlib
 from pathlib import Path
 
 import pytest
@@ -35,6 +36,79 @@ def sequence(tmp_path, entries):
 @pytest.mark.parametrize("color", [(113, 21, 79), (103, 17, 83), (122, 30, 65)])
 def test_design_tolerates_compression_and_color_shifts(color):
     assert title_frame(rgb_frame(color), Intro()) == (True, True)
+
+
+def softened_title_frame():
+    frame = bytearray(rgb_frame())
+    for y in range(26, 44):
+        for x in range(26, 104):
+            if not (30 <= x < 100 and 30 <= y < 40):
+                index = (y * WIDTH + x) * 3
+                # Halfway between the burgundy background and white.
+                frame[index : index + 3] = bytes((184, 138, 167))
+    return bytes(frame)
+
+
+def test_soft_glyph_edges_are_part_of_the_title_palette():
+    assert title_frame(softened_title_frame(), Intro()) == (True, True)
+
+
+@pytest.mark.parametrize(
+    "chapter,first_content_seconds",
+    [("004", 1.8354), ("005", 2.5433666666666666), ("006", 2.539266666666667)],
+)
+def test_reported_logo_to_title_sequences_end_at_first_live_frame(
+    tmp_path,
+    chapter,
+    first_content_seconds,
+):
+    fixtures = Path(__file__).parent / "fixtures" / "intro"
+    frames = tmp_path / "frames.rgb"
+    frames.write_bytes(zlib.decompress((fixtures / f"{chapter}-source.rgb.zlib").read_bytes()))
+    timestamps = fixtures / f"{chapter}-source.txt"
+    assert find_intro_end(frames, timestamps, Intro(), 10) == (
+        first_content_seconds,
+        "title_removed",
+    )
+
+
+def test_branded_animation_can_precede_white_logo_and_soft_title(tmp_path):
+    blank, logo = rgb_frame(text=False), rgb_frame()
+    content = rgb_frame((10, 90, 10), text=False)
+    frames, times = sequence(
+        tmp_path,
+        [
+            (0, blank),
+            (400, blank),
+            (700, blank),
+            (850, logo),
+            (1050, logo),
+            (1300, softened_title_frame()),
+            (1700, softened_title_frame()),
+            (2000, content),
+            (2200, content),
+        ],
+    )
+    assert find_intro_end(frames, times, Intro(), 4) == (2, "title_removed")
+
+
+def test_blank_brand_color_does_not_authorize_removing_later_content(tmp_path):
+    blank, logo = rgb_frame(text=False), rgb_frame()
+    content = rgb_frame((10, 90, 10), text=False)
+    frames, times = sequence(
+        tmp_path,
+        [
+            (0, blank),
+            (100, blank),
+            (200, content),
+            (400, content),
+            (600, logo),
+            (1000, logo),
+            (1400, content),
+            (1700, content),
+        ],
+    )
+    assert find_intro_end(frames, times, Intro(), 4) == (0, "no_title_at_start")
 
 
 @pytest.mark.parametrize(

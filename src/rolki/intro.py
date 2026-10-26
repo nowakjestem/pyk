@@ -22,7 +22,12 @@ def title_frame(frame: bytes, settings: Intro) -> tuple[bool, bool]:
     if len(frame) != FRAME_BYTES:
         raise PermanentError("Niepełna klatka podczas wykrywania planszy.")
     color = tuple(int(settings.background_color[i : i + 2], 16) for i in (1, 3, 5))
-    background = white = border = border_background = 0
+    # Antialiased and compressed glyph edges are blends of the background and
+    # white, not necessarily close to either endpoint. Count their whole palette
+    # so a change from a small logo to a dense title does not look like live video.
+    white_direction = tuple(255 - channel for channel in color)
+    axis = max(range(3), key=white_direction.__getitem__)
+    background = white = palette = border = border_background = 0
     for index, (red, green, blue) in enumerate(
         zip(frame[0::3], frame[1::3], frame[2::3], strict=True)
     ):
@@ -33,8 +38,17 @@ def title_frame(frame: bytes, settings: Intro) -> tuple[bool, bool]:
         is_white = (
             min(red, green, blue) >= 210 and max(red, green, blue) - min(red, green, blue) <= 30
         )
+        is_palette = is_background or is_white
+        if not is_palette and white_direction[axis]:
+            pixel = (red, green, blue)
+            alpha = max(0, min(1, (pixel[axis] - color[axis]) / white_direction[axis]))
+            is_palette = all(
+                abs(value - (base + alpha * direction)) <= settings.color_tolerance
+                for value, base, direction in zip(pixel, color, white_direction, strict=True)
+            )
         background += is_background
         white += is_white
+        palette += is_palette
         x, y = index % WIDTH, index // WIDTH
         if x < WIDTH * 0.1 or x >= WIDTH * 0.9 or y < HEIGHT * 0.2 or y >= HEIGHT * 0.8:
             border += 1
@@ -42,7 +56,7 @@ def title_frame(frame: bytes, settings: Intro) -> tuple[bool, bool]:
     pixels = WIDTH * HEIGHT
     layout = (
         background / pixels >= 0.75
-        and (background + white) / pixels >= 0.96
+        and palette / pixels >= 0.96
         and border_background / border >= 0.95
     )
     return layout, white / pixels >= 0.002
@@ -66,6 +80,7 @@ def find_intro_end(
     frames: Path, timestamps: Path, settings: Intro, duration: float
 ) -> tuple[float, str]:
     first_title = candidate = None
+    branded_prefix = False
     count = 0
     previous_time = -1.0
     with frames.open("rb") as source:
@@ -76,10 +91,20 @@ def find_intro_end(
             previous_time = time
             layout, text = title_frame(source.read(FRAME_BYTES), settings)
             if first_title is None:
-                if time > MAX_LEAD_SECONDS:
+                if time > MAX_LEAD_SECONDS and not branded_prefix:
                     return 0.0, "no_title_at_start"
-                if layout and text:
-                    first_title = time
+                if layout:
+                    # A blank branded lead-in may precede an animated logo/text.
+                    # Still require white graphics before authorizing any cut.
+                    branded_prefix = True
+                    candidate = None
+                    if text:
+                        first_title = time
+                elif branded_prefix:
+                    if candidate is None:
+                        candidate = time
+                    if time - candidate >= CONFIRM_SECONDS:
+                        return 0.0, "no_title_at_start"
             elif layout:
                 # Keep blank burgundy frames when the title text fades away.
                 candidate = None

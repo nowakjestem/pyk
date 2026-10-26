@@ -223,18 +223,24 @@ video:
 Detektor działa lokalnie w FFmpeg i Pythonie, bez modelu AI i dodatkowych zapytań API.
 Analizuje pomniejszone klatki oryginalnego obrazu przed kadrowaniem i dodaniem napisów.
 Sprawdza dominujący kolor tła, jednolite obrzeża oraz biały napis; treść napisu może się zmieniać.
-Tolerancja RGB uwzględnia kompresję, więc klatki nie muszą być identyczne piksel w piksel.
+Tolerancja RGB uwzględnia kompresję i pośrednie kolory między tłem a bielą na rozmytych
+krawędziach liter. Klatki nie muszą być identyczne piksel w piksel. Animacja i zmiana
+logo na inny napis na tym samym tle należą do jednej sekwencji intro;
+samo zastąpienie logo tytułem nie kończy planszy.
 Nieruchomy obraz sam w sobie nie jest podstawą do cięcia.
 
 `max_scan_seconds` to maksymalne okno poszukiwania końca planszy, **nie długość cięcia**.
-Plansza musi pojawić się na początku rozdziału (do 0,35 s), trwać co najmniej 0,2 s,
-a jej zniknięcie musi potwierdzić co najmniej 0,15 s obrazu. Pojedyncza klatka zakłócenia
+Tło planszy musi pojawić się na początku rozdziału (do 0,35 s). Biały napis lub logo
+może pojawić się później po jednolitym bordowym wstępie, w granicach okna analizy;
+sam kolor bez białej grafiki nie wystarcza do cięcia. Rozpoznana plansza musi trwać
+co najmniej 0,2 s, a jej zniknięcie musi potwierdzić co najmniej 0,15 s obrazu. Pojedyncza klatka zakłócenia
 nie kończy planszy. Jednolite bordowe klatki po zniknięciu białego tekstu również są usuwane.
 Rzeczywiste znaczniki czasu klatek wyznaczają punkt cięcia także przy zmiennym FPS.
 Przy braku rozpoznania, niepotwierdzonym końcu lub mniej niż 0,3 s pozostałej treści
 rozdział zostaje bez zmian. Plansze w dalszej części rozdziału nie są usuwane.
 Przenikania i inne warianty graficzne wymagają sprawdzenia na docelowym materiale;
-progi są dostrojone do dołączonej bordowej planszy.
+progi są dostrojone do bordowych plansz. Testy regresyjne obejmują rzeczywiste sekwencje
+logo → tytuł → rozmówca z trzech zgłoszonych klipów.
 
 Ten sam wykryty początek obowiązuje audio, transkrypcję i oba warianty obrazu.
 Podział długiego rozdziału na części i limit długości w Bufferze uwzględniają czas po usunięciu planszy.
