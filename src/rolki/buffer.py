@@ -12,7 +12,7 @@ from .errors import JobError, PermanentError, TransientError
 from .openai_http import retry_after_seconds
 
 ENDPOINT = "https://api.buffer.com"
-POST_FIELDS = "id channelId dueAt status schedulingType shareMode text assets { source }"
+POST_FIELDS = "id channelId dueAt status schedulingType shareMode text"
 
 
 class AmbiguousResult(JobError):
@@ -252,8 +252,6 @@ def matches(post, request):
                 and remote_time(post) == remote_time(request)
             )
         )
-        and request["assets"][0]["video"]["url"]
-        in [a.get("source") for a in post.get("assets", [])]
     )
 
 

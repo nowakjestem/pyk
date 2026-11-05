@@ -78,7 +78,7 @@ class BufferPublisher:
                 plan,
                 delivery,
                 "unknown",
-                "Buffer zwrócił inne dane niż żądany film, termin lub tryb publikacji.",
+                "Buffer zwrócił dane niezgodne z żądanym kontem, opisem, terminem lub trybem publikacji.",
                 post_id=delivery.get("post_id") or post.get("id"),
             )
             return

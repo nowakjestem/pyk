@@ -403,12 +403,26 @@ async def test_immediate_reaction_bypasses_schedule_and_full_queue(
     assert len(client.created) == 3
 
 
-async def test_immediate_parts_continue_after_write_acknowledgement(db, buffer_config, monkeypatch):
+@pytest.mark.parametrize("buffer_copy", [False, True])
+async def test_immediate_parts_continue_after_write_acknowledgement(
+    db, buffer_config, monkeypatch, buffer_copy
+):
     job_id = prepare(db, buffer_config, approve=False)
     add_parts(db, job_id)
     store = BufferStore(db)
     assert store.accept(f"clip-{job_id}-0", "zap", "member")
     p, client = publisher(db, monkeypatch)
+    if buffer_copy:
+        create = client.create
+        copy_url = "https://buffer-updates-media-backfill-bucket.s3.amazonaws.com/clip.mp4"
+
+        async def create_with_copy(request):
+            post = await create(request)
+            post["assets"] = [{"source": copy_url}]
+            return post
+
+        monkeypatch.setattr(client, "create", create_with_copy)
+
     await p.tick(now=NOW.timestamp())
     assert len(client.created) == 6
     assert all(r["mode"] == "shareNow" for r in client.created)

@@ -225,7 +225,7 @@ Wiadomość z linkami pokazuje wybrany wariant, datę i wynik per konto:
 Późniejsze statusy publikacji i usunięcia sprawdzaj bezpośrednio w Bufferze.
 
 HTTP 200 nie jest dowodem sukcesu GraphQL. Klient sprawdza błędy w treści odpowiedzi,
-potwierdzony tryb `automatic`, stan, film, opis i termin. Nie przełącza się na
+potwierdzony tryb `automatic`, stan, konto, opis i termin. Nie przełącza się na
 przypomnienia. Przy 429 respektuje `Retry-After`; jednoznacznie nieudane próby są
 ograniczone do trzech. Buffer nie dokumentuje idempotencji `createPost`. Timeout,
 niejednoznaczny błąd serwera albo restart podczas wysyłki pozostawia `unknown`.
